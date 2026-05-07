@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import opentype from "opentype.js";
 import Icon from "@/components/ui/icon";
 import { Slider } from "@/components/ui/slider";
@@ -6,10 +6,12 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import {
   loadFontFromBuffer,
-  buildAnimatableChars,
-  drawGlyphProgress,
+  buildAnimatableCharsWrapped,
+  drawGlyphHandwrite,
+  drawGlyphWriteOn,
   drawGlyphFull,
   type AnimatableChar,
+  type WriteOnDirection,
 } from "@/lib/fontAnimator";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -25,9 +27,9 @@ interface TextStyle {
   align: "left" | "center" | "right";
 }
 
-interface Line {
-  text: string;
-  style: TextStyle;
+interface CharAnimSettings {
+  direction: WriteOnDirection;
+  delay: number; // множитель задержки 0..2
 }
 
 const ASPECT_SIZES: Record<AspectRatio, { w: number; h: number }> = {
@@ -36,7 +38,7 @@ const ASPECT_SIZES: Record<AspectRatio, { w: number; h: number }> = {
   "4:3": { w: 1440, h: 1080 },
 };
 
-const DISPLAY_SCALE = 0.42; // отображаемый масштаб превью
+const DISPLAY_SCALE = 0.4;
 
 const NAV_ITEMS: { id: Section; icon: string; label: string }[] = [
   { id: "editor", icon: "PenLine", label: "Редактор" },
@@ -47,15 +49,6 @@ const NAV_ITEMS: { id: Section; icon: string; label: string }[] = [
   { id: "docs", icon: "BookOpen", label: "Справка" },
 ];
 
-const HOTKEYS = [
-  { key: "Enter", action: "Новая строка" },
-  { key: "Space", action: "Пауза / старт" },
-  { key: "Ctrl + Z", action: "Отмена" },
-  { key: "Ctrl + B", action: "Жирный" },
-  { key: "Ctrl + I", action: "Курсив" },
-  { key: "Ctrl + E", action: "Экспорт" },
-];
-
 const DEFAULT_STYLE: TextStyle = {
   bold: false,
   italic: false,
@@ -64,47 +57,75 @@ const DEFAULT_STYLE: TextStyle = {
   align: "left",
 };
 
+const WRITE_ON_DIRECTIONS: { id: WriteOnDirection; label: string }[] = [
+  { id: "left-to-right", label: "← Слева направо" },
+  { id: "right-to-left", label: "→ Справа налево" },
+  { id: "top-to-bottom", label: "↓ Сверху вниз" },
+  { id: "bottom-to-top", label: "↑ Снизу вверх" },
+  { id: "diagonal-tl", label: "↘ По диагонали" },
+];
+
+const ALL_CHARS = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?-:;()\"'";
+
 // ── Компонент ──────────────────────────────────────────────────────────────────
 export default function Index() {
-  // Навигация
   const [section, setSection] = useState<Section>("editor");
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // Шрифт
   const [font, setFont] = useState<opentype.Font | null>(null);
-  const [fontName, setFontName] = useState<string>("");
+  const [fontName, setFontName] = useState("");
   const fontInputRef = useRef<HTMLInputElement>(null);
 
-  // Текст / строки
-  const [lines, setLines] = useState<Line[]>([{ text: "", style: { ...DEFAULT_STYLE } }]);
-  const [activeLine, setActiveLine] = useState(0);
+  // Текст (единая строка, перенос автоматически)
+  const [text, setText] = useState("");
   const [textStyle, setTextStyle] = useState<TextStyle>({ ...DEFAULT_STYLE });
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Фон
   const [bgColor, setBgColor] = useState("#ffffff");
   const [bgTransparent, setBgTransparent] = useState(false);
+  const [bgImage, setBgImage] = useState<string | null>(null);
+  const [bgImageScale, setBgImageScale] = useState([100]); // %
+  const bgImageInputRef = useRef<HTMLInputElement>(null);
 
   // Формат
   const [aspect, setAspect] = useState<AspectRatio>("16:9");
 
   // Анимация
   const [animMode, setAnimMode] = useState<AnimMode>("auto");
-  const [animSpeed, setAnimSpeed] = useState([70]);
+  const [animSpeed, setAnimSpeed] = useState([30]); // 1..100, меньше = медленнее
   const [smoothness, setSmoothness] = useState([60]);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [animProgress, setAnimProgress] = useState(0); // 0..1 общий прогресс
+  const [animProgress, setAnimProgress] = useState(0);
   const animRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number>(0);
+  const startTimeRef = useRef(0);
+  const pausedProgressRef = useRef(0);
+
+  // Ручная настройка анимации
+  const [charAnimSettings, setCharAnimSettings] = useState<Record<string, CharAnimSettings>>({});
+  const [selectedManualChar, setSelectedManualChar] = useState<string | null>(null);
+  const [manualCharFilter, setManualCharFilter] = useState("all");
 
   // Экспорт
   const [exportFormat, setExportFormat] = useState("mp4");
-  const [exportQuality] = useState("1080p");
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
 
-  // Canvas refs
+  // Canvas
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animCharsRef = useRef<AnimatableChar[]>([]);
+  const bgImageElRef = useRef<HTMLImageElement | null>(null);
 
-  // ── Загрузка шрифта ──────────────────────────────────────────────────────────
+  // ── Авторасширение textarea ────────────────────────────────────────────────
+  useEffect(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = ta.scrollHeight + "px";
+  }, [text]);
+
+  // ── Загрузка шрифта ────────────────────────────────────────────────────────
   const handleFontUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -114,25 +135,36 @@ export default function Index() {
     setFontName(file.name.replace(/\.[^.]+$/, ""));
   }, []);
 
-  // ── Сборка AnimatableChars при изменении текста/шрифта ───────────────────────
+  // ── Загрузка фонового изображения ─────────────────────────────────────────
+  const handleBgImageUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    setBgImage(url);
+    const img = new Image();
+    img.onload = () => { bgImageElRef.current = img; renderCanvasNow(animProgress); };
+    img.src = url;
+  }, []); // eslint-disable-line
+
+  // ── Сборка AnimatableChars ─────────────────────────────────────────────────
+  const rebuildChars = useCallback(() => {
+    if (!font || !text) { animCharsRef.current = []; return; }
+    const { w } = ASPECT_SIZES[aspect];
+    const chars = buildAnimatableCharsWrapped(
+      font, text,
+      textStyle.fontSize, textStyle.bold, textStyle.italic,
+      textStyle.align, textStyle.color,
+      w, 60, 60
+    );
+    animCharsRef.current = chars;
+  }, [font, text, textStyle, aspect]);
+
   useEffect(() => {
-    if (!font) return;
-    const { w, h } = ASPECT_SIZES[aspect];
-    const allChars: AnimatableChar[] = [];
-    const lineHeight = (textStyle.fontSize * 1.35);
-    const topPad = 80;
+    rebuildChars();
+  }, [rebuildChars]);
 
-    lines.forEach((line, li) => {
-      const baseline = topPad + li * lineHeight + textStyle.fontSize;
-      const chars = buildAnimatableChars(font, line.text, line.style.fontSize, 60, baseline);
-      allChars.push(...chars);
-    });
-    animCharsRef.current = allChars;
-    void w; void h;
-  }, [font, lines, textStyle, aspect]);
-
-  // ── Рендер Canvas ────────────────────────────────────────────────────────────
-  const renderCanvas = useCallback((progress: number) => {
+  // ── Рендер Canvas ──────────────────────────────────────────────────────────
+  const renderCanvasNow = useCallback((progress: number) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -140,196 +172,317 @@ export default function Index() {
 
     const { w, h } = ASPECT_SIZES[aspect];
     const dpr = DISPLAY_SCALE;
-    canvas.width = Math.round(w * dpr);
-    canvas.height = Math.round(h * dpr);
+    const cw = Math.round(w * dpr);
+    const ch = Math.round(h * dpr);
+
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw;
+      canvas.height = ch;
+    }
+
+    ctx.clearRect(0, 0, cw, ch);
 
     // Фон
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!bgTransparent) {
-      ctx.fillStyle = bgColor;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (bgImageElRef.current && bgImage) {
+        const sc = bgImageScale[0] / 100;
+        const imgW = bgImageElRef.current.naturalWidth * sc * dpr;
+        const imgH = bgImageElRef.current.naturalHeight * sc * dpr;
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(bgImageElRef.current, (cw - imgW) / 2, (ch - imgH) / 2, imgW, imgH);
+      } else {
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(0, 0, cw, ch);
+      }
     }
 
     ctx.save();
     ctx.scale(dpr, dpr);
 
     const chars = animCharsRef.current;
-    if (!chars.length) {
-      // Фолбэк: рисуем текст нативным canvas
+
+    if (!font || !chars.length) {
+      // Фолбэк — нативный canvas text
+      const lines = text.split("\n");
       lines.forEach((line, li) => {
-        const lineHeight = line.style.fontSize * 1.35;
-        const y = 80 + li * lineHeight + line.style.fontSize;
-        ctx.font = `${line.style.italic ? "italic " : ""}${line.style.bold ? "bold " : ""}${line.style.fontSize}px sans-serif`;
-        ctx.fillStyle = line.style.color;
-        ctx.fillText(line.text, 60, y);
+        const lh = textStyle.fontSize * 1.45;
+        const baseline = 60 + li * lh + textStyle.fontSize;
+        ctx.font = `${textStyle.italic ? "italic " : ""}${textStyle.bold ? "bold " : ""}${textStyle.fontSize}px sans-serif`;
+        ctx.fillStyle = textStyle.color;
+        ctx.textAlign = textStyle.align;
+        const { w: cWidth } = ASPECT_SIZES[aspect];
+        const x = textStyle.align === "center" ? cWidth / 2 : textStyle.align === "right" ? cWidth - 60 : 60;
+        ctx.fillText(line, x, baseline);
       });
       ctx.restore();
       return;
     }
 
-    const totalChars = chars.length;
-    if (totalChars === 0) { ctx.restore(); return; }
-
     if (animMode === "typewriter" && progress > 0) {
-      // Режим печатной машинки — показываем символы по одному
-      const visibleCount = Math.floor(progress * totalChars);
-      for (let i = 0; i < totalChars; i++) {
-        const ac = chars[i];
-        if (i < visibleCount) {
-          ac.glyphPaths.forEach(gp => drawGlyphFull(ctx, gp.commands, getLineStyle(i, chars, lines).color));
-        } else if (i === visibleCount && progress < 1) {
-          // Мигающий курсор
-          ctx.fillStyle = getLineStyle(i, chars, lines).color;
-          ctx.fillRect(ac.x, ac.y - ac.fontSize, 3, ac.fontSize * 1.1);
+      const n = chars.length;
+      const visible = Math.floor(progress * n);
+      chars.forEach((ac, i) => {
+        const style = textStyle;
+        if (i < visible) {
+          drawGlyphFull(ctx, ac.glyphPaths[0].commands, style.color);
+        } else if (i === visible && progress < 1) {
+          ctx.fillStyle = style.color;
+          ctx.fillRect(ac.x, ac.y - ac.fontSize, 2.5, ac.fontSize * 1.1);
         }
-      }
+      });
+
     } else if (animMode === "auto" && progress > 0) {
-      // Рукописная анимация — каждый символ по очереди, штрих за штрихом
-      const progressPerChar = 1 / totalChars;
-      for (let i = 0; i < totalChars; i++) {
-        const ac = chars[i];
-        const charStart = i * progressPerChar;
-        const charEnd = (i + 1) * progressPerChar;
-        const style = getLineStyle(i, chars, lines);
-        const strokeWidth = Math.max(1.5, ac.fontSize * 0.04);
+      const n = chars.length;
+      const ppc = 1 / n; // progress per char
+      chars.forEach((ac, i) => {
+        const charStart = i * ppc;
+        const charEnd = (i + 1) * ppc;
+        const strokeW = Math.max(1.5, ac.fontSize * 0.045);
 
         if (progress >= charEnd) {
-          // Символ уже дорисован — показываем как filled
-          ac.glyphPaths.forEach(gp => drawGlyphFull(ctx, gp.commands, style.color));
+          drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
         } else if (progress > charStart) {
-          // Символ рисуется прямо сейчас
-          const charProgress = (progress - charStart) / progressPerChar;
-          // Сначала рисуем финальный символ прозрачно (позиция не меняется)
-          ac.glyphPaths.forEach(gp =>
-            drawGlyphProgress(ctx, gp.commands, charProgress, style.color, strokeWidth)
-          );
+          const cp = (progress - charStart) / ppc;
+          drawGlyphHandwrite(ctx, ac, cp, textStyle.color, strokeW);
         }
-      }
-    } else {
-      // progress === 0 или manual — показываем все символы финально
+        // < charStart: ничего не рисуем (символ ещё не начат)
+      });
+
+    } else if (animMode === "manual" && progress > 0) {
+      const n = chars.length;
+      const ppc = 1 / n;
       chars.forEach((ac, i) => {
-        const style = getLineStyle(i, chars, lines);
-        ac.glyphPaths.forEach(gp => drawGlyphFull(ctx, gp.commands, style.color));
+        const charStart = i * ppc;
+        const charEnd = (i + 1) * ppc;
+        const settings = charAnimSettings[ac.char] ?? { direction: "left-to-right" as WriteOnDirection, delay: 0 };
+
+        if (progress >= charEnd) {
+          drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
+        } else if (progress > charStart) {
+          const cp = (progress - charStart) / ppc;
+          drawGlyphWriteOn(ctx, ac, cp, textStyle.color, settings.direction);
+        }
+      });
+
+    } else {
+      // progress=0 или нет анимации — показываем всё финально
+      chars.forEach(ac => {
+        drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
       });
     }
 
     ctx.restore();
-  }, [aspect, bgColor, bgTransparent, animMode, lines]);
+  }, [aspect, bgColor, bgTransparent, bgImage, bgImageScale, animMode, textStyle, text, font, charAnimSettings]);
 
-  // Рендер при изменении прогресса
   useEffect(() => {
-    renderCanvas(animProgress);
-  }, [animProgress, renderCanvas]);
+    renderCanvasNow(animProgress);
+  }, [animProgress, renderCanvasNow]);
 
-  // Рендер при смене раздела
+  // Форсируем рендер при смене раздела
   useEffect(() => {
-    if (section === "editor") renderCanvas(animProgress);
-  }, [section, renderCanvas, animProgress]);
+    setTimeout(() => renderCanvasNow(animProgress), 20);
+  }, [section]); // eslint-disable-line
 
-  // ── Анимационный цикл ────────────────────────────────────────────────────────
-  const startAnimation = useCallback(() => {
-    setAnimProgress(0);
-    startTimeRef.current = performance.now();
-    // Длительность: speed 100 = ~4с, speed 10 = ~20с
-    const duration = 4000 * (100 / animSpeed[0]);
+  // ── Анимационный цикл ──────────────────────────────────────────────────────
+  const getDuration = useCallback(() => {
+    // speed 1 = очень медленно (~30с), speed 100 = быстро (~1с)
+    // человеческое письмо ≈ speed 20-35
+    return 30000 / animSpeed[0];
+  }, [animSpeed]);
+
+  const startAnimation = useCallback((fromProgress = 0) => {
+    const duration = getDuration();
+    const startP = fromProgress;
+    startTimeRef.current = performance.now() - startP * duration;
 
     const tick = (now: number) => {
       const elapsed = now - startTimeRef.current;
-      const p = Math.min(elapsed / duration, 1);
-
-      // Плавность: easing
+      const raw = Math.min(elapsed / duration, 1);
       const sm = smoothness[0] / 100;
-      const eased = sm > 0.5
-        ? easeInOut(p)
-        : p < 0.5 ? 2 * p * p : -1 + (4 - 2 * p) * p;
+      const p = sm > 0.5 ? easeInOut(raw) : raw;
+      setAnimProgress(p);
 
-      setAnimProgress(eased);
-
-      if (p < 1) {
+      if (raw < 1) {
         animRef.current = requestAnimationFrame(tick);
       } else {
         setIsPlaying(false);
         setAnimProgress(1);
       }
     };
-
     animRef.current = requestAnimationFrame(tick);
-  }, [animSpeed, smoothness]);
-
-  const stopAnimation = useCallback(() => {
-    if (animRef.current) cancelAnimationFrame(animRef.current);
-    setIsPlaying(false);
-  }, []);
+  }, [getDuration, smoothness]);
 
   const togglePlay = () => {
     if (isPlaying) {
-      stopAnimation();
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      pausedProgressRef.current = animProgress;
+      setIsPlaying(false);
     } else {
+      const from = animProgress >= 1 ? 0 : animProgress;
+      if (animProgress >= 1) setAnimProgress(0);
       setIsPlaying(true);
-      startAnimation();
+      startAnimation(from);
     }
   };
 
   const resetAnim = () => {
-    stopAnimation();
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    setIsPlaying(false);
     setAnimProgress(0);
-    renderCanvas(0);
+    pausedProgressRef.current = 0;
   };
 
-  // ── Редактирование текста ────────────────────────────────────────────────────
-  const updateLineText = (idx: number, val: string) => {
-    setLines(prev => prev.map((l, i) => i === idx ? { ...l, text: val } : l));
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>, idx: number) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      const newLine: Line = { text: "", style: { ...lines[idx].style } };
-      setLines(prev => {
-        const next = [...prev];
-        next.splice(idx + 1, 0, newLine);
-        return next;
-      });
-      setActiveLine(idx + 1);
-    }
-    if (e.key === "Backspace" && lines[idx].text === "" && lines.length > 1) {
-      e.preventDefault();
-      setLines(prev => prev.filter((_, i) => i !== idx));
-      setActiveLine(Math.max(0, idx - 1));
-    }
-    if (e.ctrlKey && e.key === "b") { e.preventDefault(); applyStyle("bold", !textStyle.bold); }
-    if (e.ctrlKey && e.key === "i") { e.preventDefault(); applyStyle("italic", !textStyle.italic); }
+  // ── Редактирование текста ──────────────────────────────────────────────────
+  const handleTextKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.ctrlKey && e.key === "b") { e.preventDefault(); setTextStyle(s => ({ ...s, bold: !s.bold })); }
+    if (e.ctrlKey && e.key === "i") { e.preventDefault(); setTextStyle(s => ({ ...s, italic: !s.italic })); }
   };
 
   const applyStyle = <K extends keyof TextStyle>(key: K, val: TextStyle[K]) => {
-    setTextStyle(prev => ({ ...prev, [key]: val }));
-    setLines(prev => prev.map((l, i) => i === activeLine ? { ...l, style: { ...l.style, [key]: val } } : l));
+    setTextStyle(s => ({ ...s, [key]: val }));
   };
 
-  // ── Экспорт ────────────────────────────────────────────────────────────────
-  const handleExport = () => {
+  // ── Экспорт MP4 (через MediaRecorder + Canvas) ─────────────────────────────
+  const handleExportVideo = useCallback(async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Создаём full-res offscreen canvas
+    const { w, h } = ASPECT_SIZES[aspect];
+    const offscreen = document.createElement("canvas");
+    offscreen.width = w;
+    offscreen.height = h;
+
+    setIsExporting(true);
+    setExportProgress(0);
+
+    const fps = 60;
+    const duration = getDuration();
+    const totalFrames = Math.ceil((duration / 1000) * fps);
+
+    const stream = offscreen.captureStream(fps);
+    const mimeType = bgTransparent && exportFormat !== "mp4" ? "video/webm;codecs=vp9" : "video/webm";
+    const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+    recorder.start();
+
+    // Рендерим покадрово
+    const renderFrame = (frameIdx: number): Promise<void> =>
+      new Promise(resolve => requestAnimationFrame(() => {
+        const raw = frameIdx / totalFrames;
+        const sm = smoothness[0] / 100;
+        const p = sm > 0.5 ? easeInOut(raw) : raw;
+
+        const ctx = offscreen.getContext("2d")!;
+        ctx.clearRect(0, 0, w, h);
+
+        if (!bgTransparent) {
+          if (bgImageElRef.current && bgImage) {
+            const sc = bgImageScale[0] / 100;
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, w, h);
+            const imgW = bgImageElRef.current.naturalWidth * sc;
+            const imgH = bgImageElRef.current.naturalHeight * sc;
+            ctx.drawImage(bgImageElRef.current, (w - imgW) / 2, (h - imgH) / 2, imgW, imgH);
+          } else {
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(0, 0, w, h);
+          }
+        }
+
+        const chars = animCharsRef.current;
+        if (chars.length === 0) { resolve(); return; }
+
+        const n = chars.length;
+        const ppc = 1 / n;
+
+        if (animMode === "typewriter" && p > 0) {
+          const visible = Math.floor(p * n);
+          chars.forEach((ac, i) => {
+            if (i < visible) drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
+            else if (i === visible && p < 1) {
+              ctx.fillStyle = textStyle.color;
+              ctx.fillRect(ac.x, ac.y - ac.fontSize, 2.5, ac.fontSize * 1.1);
+            }
+          });
+        } else if (animMode === "auto" && p > 0) {
+          chars.forEach((ac, i) => {
+            const cs = i * ppc; const ce = (i + 1) * ppc;
+            const strokeW = Math.max(1.5, ac.fontSize * 0.045);
+            if (p >= ce) drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
+            else if (p > cs) drawGlyphHandwrite(ctx, ac, (p - cs) / ppc, textStyle.color, strokeW);
+          });
+        } else if (animMode === "manual" && p > 0) {
+          chars.forEach((ac, i) => {
+            const cs = i * ppc; const ce = (i + 1) * ppc;
+            const settings = charAnimSettings[ac.char] ?? { direction: "left-to-right" as WriteOnDirection };
+            if (p >= ce) drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color);
+            else if (p > cs) drawGlyphWriteOn(ctx, ac, (p - cs) / ppc, textStyle.color, settings.direction);
+          });
+        } else {
+          chars.forEach(ac => drawGlyphFull(ctx, ac.glyphPaths[0].commands, textStyle.color));
+        }
+
+        setExportProgress(Math.round((frameIdx / totalFrames) * 100));
+        resolve();
+      }));
+
+    for (let f = 0; f <= totalFrames; f++) {
+      await renderFrame(f);
+    }
+
+    recorder.stop();
+    await new Promise<void>(res => { recorder.onstop = () => res(); });
+
+    const blob = new Blob(chunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `script-animation.${exportFormat === "mp4" ? "webm" : exportFormat}`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    setIsExporting(false);
+    setExportProgress(0);
+  }, [aspect, bgColor, bgTransparent, bgImage, bgImageScale, animMode, textStyle, exportFormat, getDuration, smoothness, charAnimSettings]);
+
+  const handleExportPNG = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const url = canvas.toDataURL("image/png");
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `script-frame.png`;
-    a.click();
+    a.href = url; a.download = "script-frame.png"; a.click();
   };
 
-  // ── Helpers ──────────────────────────────────────────────────────────────────
-  const canvasSize = (() => {
+  // ── Ручная настройка ────────────────────────────────────────────────────────
+  const setCharDir = (ch: string, dir: WriteOnDirection) => {
+    setCharAnimSettings(s => ({ ...s, [ch]: { ...(s[ch] ?? { delay: 0 }), direction: dir } }));
+  };
+
+  const filteredChars = useMemo(() => {
+    const chars = ALL_CHARS.split("");
+    if (manualCharFilter === "upper") return chars.filter(c => /[А-ЯA-ZЁ]/.test(c));
+    if (manualCharFilter === "lower") return chars.filter(c => /[а-яa-zё]/.test(c));
+    if (manualCharFilter === "digits") return chars.filter(c => /[0-9]/.test(c));
+    if (manualCharFilter === "punct") return chars.filter(c => /[.,!?;:()"'-]/.test(c));
+    return chars;
+  }, [manualCharFilter]);
+
+  // ── canvasSize ─────────────────────────────────────────────────────────────
+  const canvasSize = useMemo(() => {
     const { w, h } = ASPECT_SIZES[aspect];
     return { w: Math.round(w * DISPLAY_SCALE), h: Math.round(h * DISPLAY_SCALE) };
-  })();
+  }, [aspect]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-background text-foreground">
-      {/* Sidebar */}
-      <aside
-        className={`flex flex-col transition-all duration-200 border-r border-border flex-shrink-0 ${sidebarOpen ? "w-52" : "w-14"}`}
-        style={{ background: "hsl(var(--sidebar-background))" }}
-      >
+
+      {/* ── Sidebar ── */}
+      <aside className={`flex flex-col border-r border-border flex-shrink-0 transition-all duration-200 ${sidebarOpen ? "w-52" : "w-14"}`}
+        style={{ background: "hsl(var(--sidebar-background))" }}>
         <div className="flex items-center gap-2.5 px-3 py-4 border-b border-border">
           <div className="w-7 h-7 rounded flex items-center justify-center flex-shrink-0"
             style={{ background: "hsl(var(--ink))", color: "hsl(var(--panel-bg))" }}>
@@ -340,11 +493,7 @@ export default function Index() {
         <nav className="flex-1 py-2 space-y-0.5 px-1.5">
           {NAV_ITEMS.map(item => (
             <button key={item.id} onClick={() => setSection(item.id)}
-              className={`w-full flex items-center gap-2.5 px-2 py-2 rounded text-sm transition-all ${
-                section === item.id
-                  ? "font-medium text-[hsl(var(--ink))]"
-                  : "text-[hsl(var(--sidebar-foreground))] hover:text-foreground hover:bg-[hsl(var(--sidebar-accent))]"
-              }`}
+              className={`w-full flex items-center gap-2.5 px-2 py-2 rounded text-sm transition-all ${section === item.id ? "font-medium text-[hsl(var(--ink))]" : "text-[hsl(var(--sidebar-foreground))] hover:text-foreground hover:bg-[hsl(var(--sidebar-accent))]"}`}
               style={section === item.id ? { background: "hsl(158 64% 52% / 0.12)" } : {}}>
               <Icon name={item.icon} size={16} className="flex-shrink-0" />
               {sidebarOpen && <span>{item.label}</span>}
@@ -357,38 +506,44 @@ export default function Index() {
         </button>
       </aside>
 
-      {/* Main */}
+      {/* ── Main ── */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+
         {/* Topbar */}
         <header className="flex items-center justify-between px-4 h-11 border-b border-border flex-shrink-0"
           style={{ background: "hsl(var(--panel-bg))" }}>
-          <div className="flex items-center gap-3">
-            {font
-              ? <span className="text-xs font-medium text-foreground">{fontName}</span>
-              : <span className="text-xs text-[hsl(var(--muted-foreground))]">Шрифт не загружен</span>
-            }
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-[hsl(var(--muted-foreground))]">
+              {font ? fontName : "Шрифт не загружен"}
+            </span>
+            <Badge variant="outline" className="text-[10px] h-4 px-1.5 border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]">{aspect}</Badge>
             <Badge variant="outline" className="text-[10px] h-4 px-1.5 border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]">
-              {aspect}
+              {animMode === "auto" ? "✍️ Авто" : animMode === "manual" ? "🎛️ Ручная" : "⌨️ Машинка"}
             </Badge>
           </div>
           <div className="flex items-center gap-1.5">
-            <button onClick={handleExport}
-              className="text-xs px-2.5 py-1 rounded font-medium transition-colors"
+            <button onClick={handleExportPNG}
+              className="text-xs px-2 py-1 rounded border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:text-foreground transition-colors">
+              PNG кадр
+            </button>
+            <button onClick={handleExportVideo}
+              disabled={isExporting}
+              className="text-xs px-2.5 py-1 rounded font-medium transition-colors disabled:opacity-50"
               style={{ background: "hsl(var(--ink))", color: "hsl(var(--panel-bg))" }}>
-              Экспорт кадра
+              {isExporting ? `Экспорт ${exportProgress}%…` : "Экспорт видео"}
             </button>
           </div>
         </header>
 
-        {/* Body */}
+        {/* Content */}
         <div className="flex-1 flex overflow-hidden">
 
-          {/* ═══ EDITOR ═══ */}
+          {/* ═══════════ EDITOR ═══════════ */}
           {section === "editor" && (
             <div className="flex-1 flex overflow-hidden animate-fade-in">
 
-              {/* Left: text input + formatting */}
-              <div className="w-72 flex-shrink-0 flex flex-col border-r border-border overflow-y-auto"
+              {/* Left panel */}
+              <div className="w-80 flex-shrink-0 flex flex-col border-r border-border overflow-y-auto"
                 style={{ background: "hsl(var(--panel-bg))" }}>
 
                 {/* Font upload */}
@@ -398,103 +553,105 @@ export default function Index() {
                   <button onClick={() => fontInputRef.current?.click()}
                     className="w-full py-2 rounded border-2 border-dashed border-[hsl(var(--border))] text-xs text-[hsl(var(--muted-foreground))] hover:border-[hsl(var(--ink-dim))] hover:text-foreground transition-colors flex items-center justify-center gap-2">
                     <Icon name="Upload" size={13} />
-                    {font ? `Заменить (${fontName})` : "Загрузить .ttf / .otf / .woff"}
+                    {font ? `Заменить: ${fontName}` : "Загрузить .ttf / .otf / .woff"}
                   </button>
-                  {font && (
-                    <div className="mt-2 flex gap-1.5">
-                      <button onClick={() => { setAnimMode("auto"); setSection("animation"); }}
-                        className="flex-1 py-1.5 text-[11px] rounded border transition-colors text-center"
-                        style={{ borderColor: animMode === "auto" ? "hsl(var(--ink))" : "hsl(var(--border))", color: animMode === "auto" ? "hsl(var(--ink))" : "hsl(var(--muted-foreground))", background: animMode === "auto" ? "hsl(158 64% 52% / 0.1)" : "transparent" }}>
-                        ✍️ Авто
-                      </button>
-                      <button onClick={() => { setAnimMode("manual"); setSection("animation"); }}
-                        className="flex-1 py-1.5 text-[11px] rounded border transition-colors text-center"
-                        style={{ borderColor: animMode === "manual" ? "hsl(var(--ink))" : "hsl(var(--border))", color: animMode === "manual" ? "hsl(var(--ink))" : "hsl(var(--muted-foreground))", background: animMode === "manual" ? "hsl(158 64% 52% / 0.1)" : "transparent" }}>
-                        🎛️ Ручная
-                      </button>
-                      <button onClick={() => { setAnimMode("typewriter"); setSection("animation"); }}
-                        className="flex-1 py-1.5 text-[11px] rounded border transition-colors text-center"
-                        style={{ borderColor: animMode === "typewriter" ? "hsl(var(--ink))" : "hsl(var(--border))", color: animMode === "typewriter" ? "hsl(var(--ink))" : "hsl(var(--muted-foreground))", background: animMode === "typewriter" ? "hsl(158 64% 52% / 0.1)" : "transparent" }}>
-                        ⌨️ Машинка
-                      </button>
-                    </div>
-                  )}
                 </div>
 
-                {/* Formatting toolbar */}
-                <div className="px-4 py-2.5 border-b border-border flex items-center gap-1.5 flex-wrap">
-                  <button onClick={() => applyStyle("bold", !textStyle.bold)}
-                    className={`px-2 py-1 rounded text-xs font-bold transition-colors ${textStyle.bold ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
-                    style={textStyle.bold ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>B</button>
-                  <button onClick={() => applyStyle("italic", !textStyle.italic)}
-                    className={`px-2 py-1 rounded text-xs italic transition-colors ${textStyle.italic ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
-                    style={textStyle.italic ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>I</button>
-                  <div className="w-px h-4 bg-[hsl(var(--border))]" />
-                  {(["left", "center", "right"] as const).map(a => (
-                    <button key={a} onClick={() => applyStyle("align", a)}
-                      className={`p-1 rounded transition-colors ${textStyle.align === a ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
-                      style={textStyle.align === a ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>
-                      <Icon name={a === "left" ? "AlignLeft" : a === "center" ? "AlignCenter" : "AlignRight"} size={13} />
-                    </button>
-                  ))}
-                  <div className="w-px h-4 bg-[hsl(var(--border))]" />
-                  <input type="color" value={textStyle.color}
-                    onChange={e => applyStyle("color", e.target.value)}
-                    className="w-6 h-6 rounded cursor-pointer border border-[hsl(var(--border))] bg-transparent" />
-                  <div className="w-px h-4 bg-[hsl(var(--border))]" />
-                  <div className="flex items-center gap-1">
-                    <button onClick={() => applyStyle("fontSize", Math.max(12, textStyle.fontSize - 4))}
-                      className="px-1.5 py-0.5 rounded text-xs text-[hsl(var(--muted-foreground))] hover:text-foreground transition-colors">−</button>
-                    <span className="text-[11px] font-mono-code text-foreground w-6 text-center">{textStyle.fontSize}</span>
-                    <button onClick={() => applyStyle("fontSize", Math.min(200, textStyle.fontSize + 4))}
-                      className="px-1.5 py-0.5 rounded text-xs text-[hsl(var(--muted-foreground))] hover:text-foreground transition-colors">+</button>
+                {/* Animation mode */}
+                <div className="px-4 py-3 border-b border-border">
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Режим анимации</p>
+                  <div className="flex gap-1">
+                    {([["auto", "✍️ Авто"], ["manual", "🎛️ Ручная"], ["typewriter", "⌨️ Машинка"]] as [AnimMode, string][]).map(([id, label]) => (
+                      <button key={id} onClick={() => setAnimMode(id)}
+                        className="flex-1 py-1.5 text-[11px] rounded border transition-colors text-center"
+                        style={animMode === id
+                          ? { borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" }
+                          : { borderColor: "hsl(var(--border))", color: "hsl(var(--muted-foreground))" }}>
+                        {label}
+                      </button>
+                    ))}
                   </div>
                 </div>
 
-                {/* Text input — линии */}
-                <div className="flex-1 p-4 space-y-1.5">
-                  <p className="text-[11px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Текст (Enter = новая строка)</p>
-                  {lines.map((line, idx) => (
-                    <div key={idx} className="relative">
-                      <textarea
-                        value={line.text}
-                        rows={1}
-                        onFocus={() => setActiveLine(idx)}
-                        onChange={e => updateLineText(idx, e.target.value)}
-                        onKeyDown={e => handleKeyDown(e, idx)}
-                        className="w-full bg-[hsl(var(--surface))] border border-[hsl(var(--border))] rounded px-3 py-2 text-sm resize-none focus:outline-none transition-colors text-foreground placeholder:text-[hsl(var(--muted-foreground))]"
-                        style={{
-                          fontWeight: line.style.bold ? "bold" : "normal",
-                          fontStyle: line.style.italic ? "italic" : "normal",
-                          textAlign: line.style.align,
-                          borderColor: activeLine === idx ? "hsl(var(--ink))" : undefined,
-                        }}
-                        placeholder={idx === 0 ? "Введите текст…" : "Строка " + (idx + 1)}
-                      />
-                      {lines.length > 1 && (
-                        <button onClick={() => { setLines(prev => prev.filter((_, i) => i !== idx)); setActiveLine(Math.max(0, idx - 1)); }}
-                          className="absolute right-2 top-2 text-[hsl(var(--muted-foreground))] hover:text-red-400 transition-colors">
-                          <Icon name="X" size={11} />
-                        </button>
-                      )}
+                {/* Speed (в редакторе) */}
+                <div className="px-4 py-3 border-b border-border">
+                  <div className="flex justify-between mb-1.5">
+                    <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider">Скорость анимации</p>
+                    <span className="text-[11px] font-mono-code" style={{ color: "hsl(var(--ink))" }}>{animSpeed[0]}</span>
+                  </div>
+                  <Slider value={animSpeed} onValueChange={setAnimSpeed} min={1} max={100} step={1} />
+                  <div className="flex justify-between mt-1">
+                    <span className="text-[10px] text-[hsl(var(--muted-foreground))]">Медленно</span>
+                    <span className="text-[10px] text-[hsl(var(--muted-foreground))]">Быстро</span>
+                  </div>
+                </div>
+
+                {/* Formatting */}
+                <div className="px-4 py-2.5 border-b border-border">
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Форматирование</p>
+                  <div className="flex items-center gap-1 flex-wrap mb-3">
+                    <button onClick={() => applyStyle("bold", !textStyle.bold)}
+                      className={`px-2 py-1 rounded text-xs font-bold transition-colors ${textStyle.bold ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
+                      style={textStyle.bold ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>B</button>
+                    <button onClick={() => applyStyle("italic", !textStyle.italic)}
+                      className={`px-2 py-1 rounded text-xs italic transition-colors ${textStyle.italic ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
+                      style={textStyle.italic ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>I</button>
+                    <div className="w-px h-4 bg-[hsl(var(--border))]" />
+                    {(["left", "center", "right"] as const).map(a => (
+                      <button key={a} onClick={() => applyStyle("align", a)}
+                        className={`p-1 rounded transition-colors ${textStyle.align === a ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
+                        style={textStyle.align === a ? { background: "hsl(158 64% 52% / 0.1)" } : {}}>
+                        <Icon name={a === "left" ? "AlignLeft" : a === "center" ? "AlignCenter" : "AlignRight"} size={13} />
+                      </button>
+                    ))}
+                    <div className="w-px h-4 bg-[hsl(var(--border))]" />
+                    <input type="color" value={textStyle.color} onChange={e => applyStyle("color", e.target.value)}
+                      title="Цвет текста"
+                      className="w-6 h-6 rounded cursor-pointer border border-[hsl(var(--border))] bg-transparent" />
+                  </div>
+                  {/* Размер шрифта ползунком */}
+                  <div>
+                    <div className="flex justify-between mb-1.5">
+                      <label className="text-[11px] text-[hsl(var(--muted-foreground))]">Размер шрифта</label>
+                      <span className="text-[11px] font-mono-code" style={{ color: "hsl(var(--ink))" }}>{textStyle.fontSize}px</span>
                     </div>
-                  ))}
-                  <button onClick={() => setLines(prev => [...prev, { text: "", style: { ...textStyle } }])}
-                    className="w-full py-1.5 text-xs text-[hsl(var(--muted-foreground))] hover:text-foreground border border-dashed border-[hsl(var(--border))] rounded hover:border-[hsl(var(--ink-dim))] transition-colors flex items-center justify-center gap-1.5">
-                    <Icon name="Plus" size={12} />
-                    Добавить строку
-                  </button>
+                    <Slider value={[textStyle.fontSize]} onValueChange={([v]) => applyStyle("fontSize", v)} min={12} max={200} step={1} />
+                  </div>
+                </div>
+
+                {/* Text input */}
+                <div className="px-4 py-3 border-b border-border flex-1">
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">
+                    Текст <span className="normal-case">(Enter = новая строка)</span>
+                  </p>
+                  <textarea
+                    ref={textareaRef}
+                    value={text}
+                    onChange={e => setText(e.target.value)}
+                    onKeyDown={handleTextKeyDown}
+                    className="w-full bg-[hsl(var(--surface))] border border-[hsl(var(--border))] rounded px-3 py-2.5 text-sm resize-none focus:outline-none transition-colors placeholder:text-[hsl(var(--muted-foreground))] overflow-hidden"
+                    style={{
+                      fontWeight: textStyle.bold ? "bold" : "normal",
+                      fontStyle: textStyle.italic ? "italic" : "normal",
+                      textAlign: textStyle.align,
+                      color: textStyle.color === "#ffffff" ? "hsl(var(--foreground))" : textStyle.color,
+                      borderColor: undefined,
+                      minHeight: 80,
+                    }}
+                    placeholder="Введите текст. Текст автоматически переносится, либо нажмите Enter…"
+                  />
                 </div>
 
                 {/* Background */}
-                <div className="px-4 py-3 border-t border-border space-y-2">
-                  <p className="text-[11px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider">Фон</p>
-                  <div className="flex items-center gap-2">
+                <div className="px-4 py-3 border-b border-border">
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Фон</p>
+                  <div className="flex flex-wrap gap-1.5 mb-2">
                     <button onClick={() => setBgTransparent(!bgTransparent)}
-                      className={`px-2.5 py-1.5 rounded text-xs border transition-colors flex items-center gap-1.5 ${bgTransparent ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
-                      style={bgTransparent ? { borderColor: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" } : { borderColor: "hsl(var(--border))" }}>
-                      <Icon name="Layers" size={11} />
-                      Прозрачный
+                      className="px-2.5 py-1.5 rounded text-[11px] border transition-colors flex items-center gap-1.5"
+                      style={bgTransparent
+                        ? { borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" }
+                        : { borderColor: "hsl(var(--border))", color: "hsl(var(--muted-foreground))" }}>
+                      <Icon name="Layers" size={11} />Прозрачный
                     </button>
                     {!bgTransparent && (
                       <div className="flex items-center gap-1.5">
@@ -504,16 +661,37 @@ export default function Index() {
                       </div>
                     )}
                   </div>
+                  <input ref={bgImageInputRef} type="file" accept="image/*" className="hidden" onChange={handleBgImageUpload} />
+                  <button onClick={() => bgImageInputRef.current?.click()}
+                    className="w-full py-1.5 text-[11px] rounded border border-dashed border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:border-[hsl(var(--ink-dim))] hover:text-foreground transition-colors flex items-center justify-center gap-1.5 mb-2">
+                    <Icon name="ImagePlus" size={12} />
+                    {bgImage ? "Заменить фоновое изображение" : "Загрузить фоновое изображение"}
+                  </button>
+                  {bgImage && (
+                    <div>
+                      <div className="flex justify-between mb-1">
+                        <label className="text-[11px] text-[hsl(var(--muted-foreground))]">Масштаб изображения</label>
+                        <span className="text-[11px] font-mono-code" style={{ color: "hsl(var(--ink))" }}>{bgImageScale[0]}%</span>
+                      </div>
+                      <Slider value={bgImageScale} onValueChange={setBgImageScale} min={10} max={200} step={5} />
+                      <button onClick={() => { setBgImage(null); bgImageElRef.current = null; }}
+                        className="mt-1.5 text-[11px] text-red-400 hover:text-red-300 transition-colors">
+                        Удалить изображение
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Aspect ratio */}
-                <div className="px-4 py-3 border-t border-border">
-                  <p className="text-[11px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Формат (Full HD)</p>
+                <div className="px-4 py-3">
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Формат Full HD</p>
                   <div className="flex gap-1.5">
                     {(["16:9", "9:16", "4:3"] as AspectRatio[]).map(a => (
                       <button key={a} onClick={() => setAspect(a)}
-                        className={`flex-1 py-1.5 text-[11px] rounded border transition-colors font-mono-code ${aspect === a ? "text-[hsl(var(--ink))]" : "text-[hsl(var(--muted-foreground))] hover:text-foreground"}`}
-                        style={aspect === a ? { borderColor: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" } : { borderColor: "hsl(var(--border))" }}>
+                        className="flex-1 py-1.5 text-[11px] rounded border transition-colors font-mono-code"
+                        style={aspect === a
+                          ? { borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" }
+                          : { borderColor: "hsl(var(--border))", color: "hsl(var(--muted-foreground))" }}>
                         {a}
                       </button>
                     ))}
@@ -521,17 +699,20 @@ export default function Index() {
                 </div>
               </div>
 
-              {/* Preview canvas */}
+              {/* Preview */}
               <div className="flex-1 flex flex-col min-w-0">
                 <div className="flex-1 flex items-center justify-center overflow-auto p-6 relative"
                   style={{ background: "hsl(220 18% 6%)" }}>
                   <div className="absolute inset-0 pointer-events-none"
-                    style={{ backgroundImage: "linear-gradient(hsl(220 12% 18% / 0.25) 1px, transparent 1px), linear-gradient(90deg, hsl(220 12% 18% / 0.25) 1px, transparent 1px)", backgroundSize: "32px 32px" }} />
+                    style={{ backgroundImage: "linear-gradient(hsl(220 12% 18% / 0.2) 1px, transparent 1px), linear-gradient(90deg, hsl(220 12% 18% / 0.2) 1px, transparent 1px)", backgroundSize: "32px 32px" }} />
                   <div className="relative shadow-2xl"
-                    style={{ width: canvasSize.w, height: canvasSize.h,
-                      backgroundImage: bgTransparent ? "repeating-conic-gradient(#888 0% 25%, #bbb 0% 50%) 0 0 / 16px 16px" : undefined }}>
-                    <canvas ref={canvasRef}
-                      style={{ width: canvasSize.w, height: canvasSize.h, display: "block" }} />
+                    style={{
+                      width: canvasSize.w, height: canvasSize.h,
+                      backgroundImage: bgTransparent ? "repeating-conic-gradient(#666 0% 25%, #999 0% 50%) 0 0 / 14px 14px" : undefined,
+                      borderRadius: 4,
+                      overflow: "hidden",
+                    }}>
+                    <canvas ref={canvasRef} style={{ width: canvasSize.w, height: canvasSize.h, display: "block" }} />
                   </div>
                 </div>
 
@@ -540,10 +721,13 @@ export default function Index() {
                   <div className="timeline-track mb-3 cursor-pointer"
                     onClick={e => {
                       const rect = e.currentTarget.getBoundingClientRect();
-                      setAnimProgress(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)));
+                      const p = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                      if (animRef.current) cancelAnimationFrame(animRef.current);
+                      setIsPlaying(false);
+                      setAnimProgress(p);
                     }}>
                     <div className="timeline-progress" style={{ width: `${animProgress * 100}%` }} />
-                    <div className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border-2 bg-background transition-all"
+                    <div className="absolute top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border-2 bg-background"
                       style={{ left: `calc(${animProgress * 100}% - 5px)`, borderColor: "hsl(var(--ink))" }} />
                   </div>
                   <div className="flex items-center gap-3">
@@ -551,154 +735,232 @@ export default function Index() {
                       <Icon name="SkipBack" size={15} />
                     </button>
                     <button onClick={togglePlay}
-                      className="w-8 h-8 rounded-full flex items-center justify-center transition-all"
+                      className="w-8 h-8 rounded-full flex items-center justify-center"
                       style={{ background: "hsl(var(--ink))", color: "hsl(var(--panel-bg))" }}>
                       <Icon name={isPlaying ? "Pause" : "Play"} size={14} />
                     </button>
                     <div className="flex-1" />
-                    <span className="text-xs font-mono-code text-[hsl(var(--muted-foreground))]">
-                      {animMode === "auto" ? "✍️ Рукопись" : animMode === "manual" ? "🎛️ Ручная" : "⌨️ Машинка"}
+                    <span className="text-[11px] font-mono-code text-[hsl(var(--muted-foreground))]">
+                      {(animProgress * getDuration() / 1000).toFixed(1)}s / {(getDuration() / 1000).toFixed(1)}s
                     </span>
-                    <div className="w-px h-4 bg-[hsl(var(--border))]" />
-                    <span className="text-xs font-mono-code text-[hsl(var(--muted-foreground))]">{aspect} · Full HD</span>
                   </div>
                 </div>
               </div>
             </div>
           )}
 
-          {/* ═══ ANIMATION ═══ */}
+          {/* ═══════════ ANIMATION ═══════════ */}
           {section === "animation" && (
-            <div className="flex-1 overflow-y-auto p-6 animate-fade-in max-w-2xl">
-              <h2 className="text-sm font-semibold mb-1">Режим анимации</h2>
-              <p className="text-xs text-[hsl(var(--muted-foreground))] mb-5">Выберите способ появления текста</p>
-
-              <div className="grid grid-cols-3 gap-3 mb-6">
-                {[
-                  { id: "auto" as AnimMode, icon: "✍️", name: "Авто-рукопись", desc: "Каждый символ пишется штрихами по SVG-контурам шрифта, слева направо" },
-                  { id: "manual" as AnimMode, icon: "🎛️", name: "Ручная настройка", desc: "Пользователь сам задаёт порядок и вектор появления каждого символа" },
-                  { id: "typewriter" as AnimMode, icon: "⌨️", name: "Печатная машинка", desc: "Символы появляются один за другим с курсором" },
-                ].map(m => (
-                  <div key={m.id} onClick={() => setAnimMode(m.id)}
-                    className={`mode-card p-4 cursor-pointer ${animMode === m.id ? "selected" : ""}`}>
-                    <div className="text-2xl mb-2">{m.icon}</div>
-                    <div className="text-sm font-medium mb-1">{m.name}</div>
-                    <div className="text-xs text-[hsl(var(--muted-foreground))]">{m.desc}</div>
+            <div className="flex-1 flex overflow-hidden animate-fade-in">
+              {/* Режим */}
+              <div className="w-72 flex-shrink-0 border-r border-border overflow-y-auto p-4 space-y-4"
+                style={{ background: "hsl(var(--panel-bg))" }}>
+                <div>
+                  <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider mb-2">Режим</p>
+                  <div className="space-y-1.5">
+                    {([["auto", "✍️", "Авто-рукопись", "Штрих за штрихом по контурам шрифта"],
+                      ["manual", "🎛️", "Ручная настройка", "Write-on для каждой буквы отдельно"],
+                      ["typewriter", "⌨️", "Печатная машинка", "Символы появляются по одному"]] as [AnimMode, string, string, string][]).map(([id, icon, name, desc]) => (
+                      <div key={id} onClick={() => setAnimMode(id)}
+                        className={`mode-card p-3 cursor-pointer ${animMode === id ? "selected" : ""}`}>
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <span>{icon}</span>
+                          <span className="text-sm font-medium">{name}</span>
+                        </div>
+                        <p className="text-[11px] text-[hsl(var(--muted-foreground))] ml-6">{desc}</p>
+                      </div>
+                    ))}
                   </div>
-                ))}
+                </div>
+                <div className="border-t border-[hsl(var(--border))] pt-4 space-y-4">
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <label className="text-xs text-foreground">Скорость</label>
+                      <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{animSpeed[0]}</span>
+                    </div>
+                    <Slider value={animSpeed} onValueChange={setAnimSpeed} min={1} max={100} step={1} />
+                    <div className="flex justify-between mt-1">
+                      <span className="text-[10px] text-[hsl(var(--muted-foreground))]">Медленно (~30c)</span>
+                      <span className="text-[10px] text-[hsl(var(--muted-foreground))]">Быстро (~0.3c)</span>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <label className="text-xs text-foreground">Плавность (easing)</label>
+                      <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{smoothness[0]}%</span>
+                    </div>
+                    <Slider value={smoothness} onValueChange={setSmoothness} min={0} max={100} step={5} />
+                  </div>
+                </div>
               </div>
 
-              <div className="border-t border-[hsl(var(--border))] pt-5 space-y-5">
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <label className="text-xs text-foreground">Скорость анимации</label>
-                    <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{animSpeed[0]}%</span>
-                  </div>
-                  <Slider value={animSpeed} onValueChange={setAnimSpeed} min={10} max={200} step={5} />
-                  <p className="text-[11px] text-[hsl(var(--muted-foreground))] mt-1">100% ≈ скорость реального письма</p>
-                </div>
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <label className="text-xs text-foreground">Плавность штриха</label>
-                    <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{smoothness[0]}%</span>
-                  </div>
-                  <Slider value={smoothness} onValueChange={setSmoothness} min={0} max={100} step={5} />
-                </div>
-
-                {animMode === "manual" && (
-                  <div className="rounded-lg border border-[hsl(var(--border))] p-4" style={{ background: "hsl(var(--surface))" }}>
-                    <div className="flex items-center gap-2 mb-3">
-                      <Icon name="Edit3" size={14} style={{ color: "hsl(var(--ink))" }} />
-                      <span className="text-sm font-medium">Ручной редактор символов</span>
-                    </div>
-                    <p className="text-xs text-[hsl(var(--muted-foreground))] mb-3">
-                      Загрузите шрифт и введите текст. Затем для каждого символа можно задать вектор проявления — направление штриха и его порядок.
+              {/* Ручная настройка */}
+              <div className="flex-1 overflow-y-auto p-5">
+                {animMode === "manual" ? (
+                  <>
+                    <h2 className="text-sm font-semibold mb-1">Ручная настройка Write-on</h2>
+                    <p className="text-xs text-[hsl(var(--muted-foreground))] mb-4">
+                      Нажмите на букву или символ и задайте направление проявления — как в Adobe Premiere Pro «Write-on».
                     </p>
-                    <div className="space-y-1.5 mb-3">
-                      {lines.flatMap(l => l.text.split("")).slice(0, 12).map((ch, i) => (
-                        <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 rounded border border-[hsl(var(--border))]"
-                          style={{ background: "hsl(var(--panel-bg))" }}>
-                          <span className="font-mono-code text-[11px] w-5 text-center text-[hsl(var(--muted-foreground))]">{i + 1}</span>
-                          <span className="text-base" style={{ fontFamily: "serif", minWidth: 20 }}>{ch}</span>
-                          <div className="flex-1" />
-                          <select className="text-[10px] bg-[hsl(var(--surface))] border border-[hsl(var(--border))] rounded px-1.5 py-0.5 text-foreground">
-                            <option>Слева направо →</option>
-                            <option>Сверху вниз ↓</option>
-                            <option>По диагонали ↘</option>
-                          </select>
-                        </div>
+                    {/* Фильтр */}
+                    <div className="flex gap-1.5 mb-4 flex-wrap">
+                      {[["all", "Все"], ["upper", "Заглавные"], ["lower", "Строчные"], ["digits", "Цифры"], ["punct", "Знаки"]].map(([id, label]) => (
+                        <button key={id} onClick={() => setManualCharFilter(id)}
+                          className="px-2.5 py-1 rounded text-xs border transition-colors"
+                          style={manualCharFilter === id
+                            ? { borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" }
+                            : { borderColor: "hsl(var(--border))", color: "hsl(var(--muted-foreground))" }}>
+                          {label}
+                        </button>
                       ))}
                     </div>
-                    <button className="text-xs px-3 py-1.5 rounded font-medium transition-colors"
-                      style={{ background: "hsl(var(--ink))", color: "hsl(var(--panel-bg))" }}>
-                      Активировать настройки
-                    </button>
+                    {/* Сетка символов */}
+                    <div className="flex flex-wrap gap-1.5 mb-5">
+                      {filteredChars.map(ch => {
+                        const hasSetting = !!charAnimSettings[ch];
+                        return (
+                          <button key={ch} onClick={() => setSelectedManualChar(ch === selectedManualChar ? null : ch)}
+                            className="w-10 h-10 rounded border text-base transition-all relative"
+                            style={{
+                              fontFamily: font ? "serif" : "sans-serif",
+                              borderColor: selectedManualChar === ch ? "hsl(var(--ink))" : hasSetting ? "hsl(var(--ink-dim))" : "hsl(var(--border))",
+                              background: selectedManualChar === ch ? "hsl(158 64% 52% / 0.15)" : "hsl(var(--surface))",
+                              color: "hsl(var(--foreground))",
+                            }}>
+                            {ch}
+                            {hasSetting && (
+                              <span className="absolute top-0 right-0 w-2 h-2 rounded-full"
+                                style={{ background: "hsl(var(--ink))", transform: "translate(25%, -25%)" }} />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Настройки выбранного символа */}
+                    {selectedManualChar && (
+                      <div className="rounded-lg border border-[hsl(var(--border))] p-4 max-w-sm animate-slide-up"
+                        style={{ background: "hsl(var(--surface))" }}>
+                        <div className="flex items-center gap-3 mb-4">
+                          <div className="w-12 h-12 rounded border border-[hsl(var(--border))] flex items-center justify-center text-2xl bg-background"
+                            style={{ fontFamily: font ? "serif" : "sans-serif" }}>
+                            {selectedManualChar}
+                          </div>
+                          <div>
+                            <p className="text-sm font-medium">Символ «{selectedManualChar}»</p>
+                            <p className="text-xs text-[hsl(var(--muted-foreground))]">Настройте направление Write-on</p>
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-[hsl(var(--muted-foreground))] mb-2 uppercase tracking-wider">Направление проявления</p>
+                        <div className="space-y-1.5">
+                          {WRITE_ON_DIRECTIONS.map(d => {
+                            const cur = charAnimSettings[selectedManualChar]?.direction ?? "left-to-right";
+                            return (
+                              <button key={d.id} onClick={() => setCharDir(selectedManualChar, d.id)}
+                                className="w-full text-left px-3 py-2 rounded text-xs border transition-colors"
+                                style={cur === d.id
+                                  ? { borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.1)" }
+                                  : { borderColor: "hsl(var(--border))", color: "hsl(var(--foreground))" }}>
+                                {d.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <button onClick={() => {
+                          setCharAnimSettings(s => {
+                            const next = { ...s };
+                            delete next[selectedManualChar];
+                            return next;
+                          });
+                        }} className="mt-3 text-xs text-red-400 hover:text-red-300 transition-colors">
+                          Сбросить настройку
+                        </button>
+                      </div>
+                    )}
+                    {Object.keys(charAnimSettings).length > 0 && (
+                      <div className="mt-4 flex items-center gap-2">
+                        <Icon name="CheckCircle" size={13} style={{ color: "hsl(var(--ink))" }} />
+                        <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                          Настроено {Object.keys(charAnimSettings).length} символов
+                        </span>
+                        <button onClick={() => setCharAnimSettings({})}
+                          className="text-xs text-red-400 hover:text-red-300 transition-colors ml-2">
+                          Сбросить всё
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full text-center">
+                    <Icon name="Info" size={28} className="mb-3 text-[hsl(var(--muted-foreground))]" />
+                    <p className="text-sm text-foreground mb-1">Выберите режим «Ручная настройка»</p>
+                    <p className="text-xs text-[hsl(var(--muted-foreground))]">Для настройки Write-on по каждому символу</p>
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          {/* ═══ FONTS ═══ */}
+          {/* ═══════════ FONTS ═══════════ */}
           {section === "fonts" && (
             <div className="flex-1 overflow-y-auto p-6 animate-fade-in">
               <div className="flex items-center justify-between mb-4">
                 <div>
-                  <h2 className="text-sm font-semibold">Шрифты</h2>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-0.5">Загрузите .ttf/.otf/.woff — программа прочитает контуры букв</p>
+                  <h2 className="text-sm font-semibold">Шрифт</h2>
+                  <p className="text-xs text-[hsl(var(--muted-foreground))] mt-0.5">Загрузите .ttf / .otf / .woff файл</p>
                 </div>
                 <button onClick={() => fontInputRef.current?.click()}
                   className="text-xs px-3 py-1.5 rounded border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:text-foreground hover:border-[hsl(var(--ink-dim))] transition-colors flex items-center gap-1.5">
                   <Icon name="Upload" size={12} />
-                  Загрузить шрифт
+                  Загрузить
                 </button>
               </div>
               {font ? (
-                <div className="rounded-lg border p-4 mb-4 max-w-lg" style={{ borderColor: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.06)" }}>
+                <div className="rounded-lg border p-4 mb-4 max-w-md" style={{ borderColor: "hsl(var(--ink))", background: "hsl(158 64% 52% / 0.06)" }}>
                   <div className="flex items-center gap-2 mb-2">
                     <Icon name="CheckCircle" size={14} style={{ color: "hsl(var(--ink))" }} />
                     <span className="text-sm font-medium">{fontName}</span>
-                    <Badge variant="outline" className="text-[9px] h-4 px-1.5 border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]">Загружен</Badge>
                   </div>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
-                    SVG-контуры букв готовы. Режим анимации «Авто-рукопись» будет рисовать каждый символ штрихами по кривым Безье.
-                  </p>
+                  <p className="text-xs text-[hsl(var(--muted-foreground))]">SVG-контуры прочитаны. Режим «Авто-рукопись» нарисует каждый символ штрихами по кривым Безье.</p>
                 </div>
               ) : (
-                <div className="rounded-lg border-2 border-dashed border-[hsl(var(--border))] p-8 text-center max-w-lg">
+                <div className="rounded-lg border-2 border-dashed border-[hsl(var(--border))] p-8 text-center max-w-md cursor-pointer hover:border-[hsl(var(--ink-dim))] transition-colors"
+                  onClick={() => fontInputRef.current?.click()}>
                   <Icon name="Upload" size={24} className="mx-auto mb-3 text-[hsl(var(--muted-foreground))]" />
                   <p className="text-sm text-foreground mb-1">Загрузите шрифтовой файл</p>
-                  <p className="text-xs text-[hsl(var(--muted-foreground))]">Поддерживаются .ttf, .otf, .woff</p>
+                  <p className="text-xs text-[hsl(var(--muted-foreground))]">.ttf, .otf, .woff</p>
                 </div>
               )}
-              <div className="rounded-lg border border-[hsl(var(--border))] p-4 max-w-lg" style={{ background: "hsl(var(--surface))" }}>
+              <div className="rounded-lg border border-[hsl(var(--border))] p-4 max-w-md mt-4" style={{ background: "hsl(var(--surface))" }}>
                 <div className="flex items-center gap-2 mb-2">
                   <Icon name="Info" size={13} style={{ color: "hsl(var(--ink))" }} />
                   <span className="text-xs font-medium">Как работает анимация</span>
                 </div>
-                <ul className="text-xs text-[hsl(var(--muted-foreground))] space-y-1">
-                  <li>• opentype.js читает векторные контуры букв прямо из файла шрифта</li>
-                  <li>• Каждая буква строится штрихами по кривым Безье — как пером по бумаге</li>
-                  <li>• Размер штриха соответствует размеру обводки символа</li>
-                  <li>• Текст не стирается, контуры сохраняются до конца анимации</li>
+                <ul className="text-xs text-[hsl(var(--muted-foreground))] space-y-1.5">
+                  <li>• <b className="text-foreground">opentype.js</b> читает векторные контуры букв из файла шрифта</li>
+                  <li>• В режиме «Авто» — скелетная прорисовка штрихами по контурам (как пером)</li>
+                  <li>• В режиме «Ручная» — маска Write-on с выбором направления для каждого символа</li>
+                  <li>• Финальный вид (filled) всегда сохраняется — текст не стирается</li>
                 </ul>
               </div>
             </div>
           )}
 
-          {/* ═══ EXPORT ═══ */}
+          {/* ═══════════ EXPORT ═══════════ */}
           {section === "export" && (
             <div className="flex-1 overflow-y-auto p-6 animate-fade-in max-w-lg">
               <h2 className="text-sm font-semibold mb-1">Экспорт</h2>
-              <p className="text-xs text-[hsl(var(--muted-foreground))] mb-5">Настройте формат и скачайте видео</p>
+              <p className="text-xs text-[hsl(var(--muted-foreground))] mb-5">Видео MP4 / WebM или PNG-кадр</p>
               <div className="space-y-5">
                 <div>
                   <label className="text-[11px] text-[hsl(var(--muted-foreground))] block mb-2 uppercase tracking-wider">Формат видео</label>
                   <div className="flex gap-2">
-                    {["mp4", "webm", "gif", "mov"].map(f => (
+                    {["mp4", "webm", "gif"].map(f => (
                       <button key={f} onClick={() => setExportFormat(f)}
-                        className={`px-3 py-1.5 rounded text-xs font-mono-code transition-all border ${exportFormat === f ? "text-[hsl(var(--ink))]" : "border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:border-[hsl(var(--ink-dim))]"}`}
-                        style={exportFormat === f ? { background: "hsl(158 64% 52% / 0.12)", borderColor: "hsl(var(--ink))" } : {}}>
+                        className="px-3 py-1.5 rounded text-xs font-mono-code border transition-all"
+                        style={exportFormat === f
+                          ? { background: "hsl(158 64% 52% / 0.12)", borderColor: "hsl(var(--ink))", color: "hsl(var(--ink))" }
+                          : { borderColor: "hsl(var(--border))", color: "hsl(var(--muted-foreground))" }}>
                         .{f}
                       </button>
                     ))}
@@ -707,49 +969,63 @@ export default function Index() {
                 <div className="flex items-center justify-between py-2">
                   <div>
                     <div className="text-xs font-medium">Прозрачный фон (Alpha)</div>
-                    <div className="text-[11px] text-[hsl(var(--muted-foreground))]">Только для .webm и .mov</div>
+                    <div className="text-[11px] text-[hsl(var(--muted-foreground))]">Применяется в .webm</div>
                   </div>
                   <Switch checked={bgTransparent} onCheckedChange={setBgTransparent} />
                 </div>
-                <div className="space-y-2.5 py-3 border-y border-[hsl(var(--border))]">
+                <div className="space-y-2 py-3 border-y border-[hsl(var(--border))]">
                   {[
-                    { label: "Формат", value: `.${exportFormat.toUpperCase()}` },
-                    { label: "Разрешение", value: aspect === "16:9" ? "1920×1080" : aspect === "9:16" ? "1080×1920" : "1440×1080" },
-                    { label: "Частота кадров", value: "60 fps" },
-                    { label: "Прозрачность", value: bgTransparent ? "Да (Alpha)" : "Нет" },
-                  ].map(r => (
-                    <div key={r.label} className="flex justify-between">
-                      <span className="text-xs text-[hsl(var(--muted-foreground))]">{r.label}</span>
-                      <span className="text-xs font-mono-code">{r.value}</span>
+                    ["Разрешение", aspect === "16:9" ? "1920×1080" : aspect === "9:16" ? "1080×1920" : "1440×1080"],
+                    ["Частота кадров", "60 fps"],
+                    ["Длительность", `${(getDuration() / 1000).toFixed(1)} сек`],
+                    ["Прозрачность", bgTransparent ? "Да (Alpha-канал)" : "Нет"],
+                  ].map(([l, v]) => (
+                    <div key={l} className="flex justify-between">
+                      <span className="text-xs text-[hsl(var(--muted-foreground))]">{l}</span>
+                      <span className="text-xs font-mono-code">{v}</span>
                     </div>
                   ))}
                 </div>
-                <button onClick={handleExport}
-                  className="w-full py-2.5 rounded text-sm font-medium transition-all flex items-center justify-center gap-2"
+                {isExporting && (
+                  <div>
+                    <div className="flex justify-between mb-1">
+                      <span className="text-xs">Рендеринг покадрово…</span>
+                      <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{exportProgress}%</span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-[hsl(var(--border))]">
+                      <div className="h-full rounded-full transition-all" style={{ width: `${exportProgress}%`, background: "hsl(var(--ink))" }} />
+                    </div>
+                  </div>
+                )}
+                <button onClick={handleExportVideo} disabled={isExporting}
+                  className="w-full py-2.5 rounded text-sm font-medium transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                   style={{ background: "hsl(var(--ink))", color: "hsl(var(--panel-bg))" }}>
-                  <Icon name="Download" size={15} />
-                  Скачать кадр (PNG)
+                  <Icon name="Film" size={15} />
+                  {isExporting ? `Экспорт ${exportProgress}%…` : "Экспорт видео (WebM)"}
                 </button>
-                <p className="text-[11px] text-[hsl(var(--muted-foreground))] text-center">Полный видеоэкспорт — в следующей версии</p>
+                <button onClick={handleExportPNG}
+                  className="w-full py-2 rounded text-sm border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:text-foreground hover:border-[hsl(var(--ink-dim))] transition-colors flex items-center justify-center gap-2">
+                  <Icon name="Image" size={15} />
+                  Скачать PNG (текущий кадр)
+                </button>
               </div>
             </div>
           )}
 
-          {/* ═══ SETTINGS ═══ */}
+          {/* ═══════════ SETTINGS ═══════════ */}
           {section === "settings" && (
             <div className="flex-1 overflow-y-auto p-6 animate-fade-in max-w-lg">
               <h2 className="text-sm font-semibold mb-1">Настройки</h2>
-              <p className="text-xs text-[hsl(var(--muted-foreground))] mb-5">Размер шрифта, фон, формат</p>
-              <div className="space-y-5">
+              <div className="space-y-5 mt-4">
                 <div>
                   <div className="flex justify-between mb-2">
-                    <label className="text-xs text-foreground">Размер шрифта по умолчанию</label>
+                    <label className="text-xs text-foreground">Размер шрифта</label>
                     <span className="text-xs font-mono-code" style={{ color: "hsl(var(--ink))" }}>{textStyle.fontSize}px</span>
                   </div>
-                  <Slider value={[textStyle.fontSize]} onValueChange={([v]) => applyStyle("fontSize", v)} min={16} max={200} step={2} />
+                  <Slider value={[textStyle.fontSize]} onValueChange={([v]) => applyStyle("fontSize", v)} min={12} max={200} step={1} />
                 </div>
                 <div className="border-t border-[hsl(var(--border))] pt-4 space-y-3">
-                  <label className="text-[11px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider block">Вид</label>
+                  <label className="text-[11px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider block">Интерфейс</label>
                   {[
                     { label: "Сетка в превью", desc: "Направляющие линии" },
                     { label: "Автосохранение", desc: "Каждые 5 минут" },
@@ -767,17 +1043,21 @@ export default function Index() {
             </div>
           )}
 
-          {/* ═══ DOCS ═══ */}
+          {/* ═══════════ DOCS ═══════════ */}
           {section === "docs" && (
             <div className="flex-1 overflow-y-auto p-6 animate-fade-in max-w-2xl">
               <h2 className="text-sm font-semibold mb-1">Справка</h2>
-              <p className="text-xs text-[hsl(var(--muted-foreground))] mb-5">Горячие клавиши и принципы работы</p>
               <div className="space-y-1.5 mb-6">
-                {HOTKEYS.map(hk => (
-                  <div key={hk.key} className="flex items-center justify-between py-2 border-b border-[hsl(var(--border)/0.5)]">
-                    <span className="text-xs">{hk.action}</span>
+                {[
+                  ["Enter", "Новая строка"],
+                  ["Ctrl + B", "Жирный"],
+                  ["Ctrl + I", "Курсив"],
+                  ["Space", "Play / Пауза (в плеере)"],
+                ].map(([k, a]) => (
+                  <div key={k} className="flex items-center justify-between py-2 border-b border-[hsl(var(--border)/0.5)]">
+                    <span className="text-xs">{a}</span>
                     <kbd className="px-2 py-0.5 rounded text-[10px] font-mono-code border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]"
-                      style={{ background: "hsl(var(--surface))" }}>{hk.key}</kbd>
+                      style={{ background: "hsl(var(--surface))" }}>{k}</kbd>
                   </div>
                 ))}
               </div>
@@ -787,11 +1067,11 @@ export default function Index() {
                   <span className="text-xs font-medium">Быстрый старт</span>
                 </div>
                 <ol className="text-xs text-[hsl(var(--muted-foreground))] space-y-1 list-decimal list-inside">
-                  <li>Загрузите рукописный .ttf шрифт через раздел «Шрифты»</li>
-                  <li>Введите текст — он сразу отобразится в превью</li>
-                  <li>Выберите режим анимации: «Авто-рукопись», «Машинка» или «Ручная»</li>
+                  <li>Загрузите рукописный .ttf шрифт</li>
+                  <li>Введите текст — он отобразится в превью мгновенно</li>
+                  <li>Выберите режим: Авто-рукопись / Ручной / Машинка</li>
                   <li>Нажмите ▶ — текст нарисуется штрих за штрихом</li>
-                  <li>Экспортируйте кадр или видео</li>
+                  <li>Экспортируйте видео или PNG кадр</li>
                 </ol>
               </div>
             </div>
@@ -803,16 +1083,6 @@ export default function Index() {
   );
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-}
-
-function getLineStyle(charIdx: number, chars: AnimatableChar[], lines: Line[]): TextStyle {
-  let count = 0;
-  for (const line of lines) {
-    count += line.text.length;
-    if (charIdx < count) return line.style;
-  }
-  return lines[lines.length - 1]?.style ?? DEFAULT_STYLE;
 }

@@ -8,244 +8,304 @@ export interface GlyphPath {
 export interface AnimatableChar {
   char: string;
   glyphPaths: GlyphPath[];
+  /** Набор точек для «чернильной» прорисовки (stroke по средней линии) */
+  strokePoints: { x: number; y: number }[][];
   x: number;
   y: number;
   unitsPerEm: number;
   fontSize: number;
+  /** Порядковый номер символа в строке */
+  charIndex: number;
+  /** Индекс строки */
+  lineIndex: number;
 }
 
-/** Загружает шрифт из ArrayBuffer и возвращает opentype.Font */
 export async function loadFontFromBuffer(buffer: ArrayBuffer): Promise<opentype.Font> {
   return opentype.parse(buffer);
 }
 
-/** Строит список анимируемых символов для строки текста */
-export function buildAnimatableChars(
+/** Строит набор AnimatableChar с учётом переноса строк (word-wrap) */
+export function buildAnimatableCharsWrapped(
   font: opentype.Font,
   text: string,
   fontSize: number,
-  startX: number,
-  baselineY: number
+  bold: boolean,
+  italic: boolean,
+  align: "left" | "center" | "right",
+  color: string,
+  canvasWidth: number,
+  padX: number,
+  padY: number
 ): AnimatableChar[] {
   const scale = fontSize / font.unitsPerEm;
-  const result: AnimatableChar[] = [];
-  let cursorX = startX;
+  const lineHeight = fontSize * 1.45;
+  const maxWidth = canvasWidth - padX * 2;
 
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (char === "\n") continue;
+  // Разбиваем на «жёсткие» строки по \n, затем word-wrap
+  const hardLines = text.split("\n");
+  const wrappedLines: string[] = [];
 
-    const glyph = font.charToGlyph(char);
-    if (!glyph) continue;
-
-    const path = glyph.getPath(cursorX, baselineY, fontSize);
-    const commands = path.commands;
-
-    result.push({
-      char,
-      glyphPaths: [{ commands, advanceWidth: (glyph.advanceWidth ?? 0) * scale }],
-      x: cursorX,
-      y: baselineY,
-      unitsPerEm: font.unitsPerEm,
-      fontSize,
-    });
-
-    cursorX += (glyph.advanceWidth ?? 0) * scale;
+  for (const hard of hardLines) {
+    if (hard.length === 0) { wrappedLines.push(""); continue; }
+    const words = hard.split(" ");
+    let currentLine = "";
+    for (const word of words) {
+      const test = currentLine ? currentLine + " " + word : word;
+      const testWidth = measureText(font, test, fontSize);
+      if (testWidth > maxWidth && currentLine.length > 0) {
+        wrappedLines.push(currentLine);
+        currentLine = word;
+      } else {
+        currentLine = test;
+      }
+    }
+    if (currentLine) wrappedLines.push(currentLine);
   }
 
+  const result: AnimatableChar[] = [];
+  let globalIdx = 0;
+
+  wrappedLines.forEach((lineText, li) => {
+    const lineWidth = measureText(font, lineText, fontSize);
+    let startX = padX;
+    if (align === "center") startX = (canvasWidth - lineWidth) / 2;
+    else if (align === "right") startX = canvasWidth - padX - lineWidth;
+
+    const baseline = padY + li * lineHeight + fontSize;
+    let cursorX = startX;
+
+    for (let ci = 0; ci < lineText.length; ci++) {
+      const char = lineText[ci];
+      const glyph = font.charToGlyph(char);
+      if (!glyph) { cursorX += fontSize * 0.3; continue; }
+
+      const path = glyph.getPath(cursorX, baseline, fontSize);
+      const commands = path.commands;
+      const advW = (glyph.advanceWidth ?? 0) * scale;
+
+      result.push({
+        char,
+        glyphPaths: [{ commands, advanceWidth: advW }],
+        strokePoints: buildStrokePoints(commands),
+        x: cursorX,
+        y: baseline,
+        unitsPerEm: font.unitsPerEm,
+        fontSize,
+        charIndex: globalIdx++,
+        lineIndex: li,
+      });
+
+      cursorX += advW;
+    }
+  });
+
+  void bold; void italic; void color;
   return result;
 }
 
-/** Вычисляет суммарную длину пути SVG-команд (приблизительно) */
-function approxPathLength(commands: opentype.PathCommand[]): number {
-  let total = 0;
-  let cx = 0, cy = 0;
-  for (const cmd of commands) {
-    if (cmd.type === "M") { cx = cmd.x; cy = cmd.y; }
-    else if (cmd.type === "L") {
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      total += Math.sqrt(dx * dx + dy * dy);
-      cx = cmd.x; cy = cmd.y;
-    } else if (cmd.type === "C") {
-      // Приблизительная длина кривой Безье
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      total += Math.sqrt(dx * dx + dy * dy) * 1.4;
-      cx = cmd.x; cy = cmd.y;
-    } else if (cmd.type === "Q") {
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      total += Math.sqrt(dx * dx + dy * dy) * 1.2;
-      cx = cmd.x; cy = cmd.y;
-    }
+function measureText(font: opentype.Font, text: string, fontSize: number): number {
+  const scale = fontSize / font.unitsPerEm;
+  let w = 0;
+  for (const ch of text) {
+    const g = font.charToGlyph(ch);
+    if (g) w += (g.advanceWidth ?? 0) * scale;
+    else w += fontSize * 0.3;
   }
-  return Math.max(total, 1);
+  return w;
 }
 
 /**
- * Рисует частичный прогресс одного символа на Canvas.
- * progress: 0.0 — 1.0
+ * Из SVG-команд строим «скелетные» полилинии для рисования пером.
+ * Каждый subpath — отдельный штрих.
  */
-export function drawGlyphProgress(
-  ctx: CanvasRenderingContext2D,
-  commands: opentype.PathCommand[],
-  progress: number,
-  strokeColor: string,
-  strokeWidth: number
-) {
-  if (progress <= 0) return;
-
-  // Разбиваем на контуры (subpath)
-  const subpaths: opentype.PathCommand[][] = [];
-  let current: opentype.PathCommand[] = [];
+function buildStrokePoints(commands: opentype.PathCommand[]): { x: number; y: number }[][] {
+  const strokes: { x: number; y: number }[][] = [];
+  let current: { x: number; y: number }[] = [];
+  let cx = 0, cy = 0;
 
   for (const cmd of commands) {
-    if (cmd.type === "M" && current.length > 0) {
-      subpaths.push(current);
+    if (cmd.type === "M") {
+      if (current.length > 1) strokes.push(current);
+      current = [{ x: cmd.x, y: cmd.y }];
+      cx = cmd.x; cy = cmd.y;
+    } else if (cmd.type === "L") {
+      current.push({ x: cmd.x, y: cmd.y });
+      cx = cmd.x; cy = cmd.y;
+    } else if (cmd.type === "C") {
+      const pts = sampleCubic(cx, cy, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y, 16);
+      current.push(...pts);
+      cx = cmd.x; cy = cmd.y;
+    } else if (cmd.type === "Q") {
+      const pts = sampleQuad(cx, cy, cmd.x1, cmd.y1, cmd.x, cmd.y, 10);
+      current.push(...pts);
+      cx = cmd.x; cy = cmd.y;
+    } else if (cmd.type === "Z") {
+      if (current.length > 0 && current[0]) {
+        current.push({ x: current[0].x, y: current[0].y });
+      }
+      if (current.length > 1) strokes.push(current);
       current = [];
     }
-    current.push(cmd);
   }
-  if (current.length > 0) subpaths.push(current);
+  if (current.length > 1) strokes.push(current);
+  return strokes;
+}
 
-  // Длины каждого сабпата
-  const lengths = subpaths.map(sp => approxPathLength(sp));
-  const totalLength = lengths.reduce((a, b) => a + b, 0);
-  const targetLength = totalLength * progress;
+function sampleCubic(
+  x0: number, y0: number, x1: number, y1: number,
+  x2: number, y2: number, x3: number, y3: number, n: number
+): { x: number; y: number }[] {
+  const pts: { x: number; y: number }[] = [];
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    const mt = 1 - t;
+    pts.push({
+      x: mt * mt * mt * x0 + 3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t * t * t * x3,
+      y: mt * mt * mt * y0 + 3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t * t * t * y3,
+    });
+  }
+  return pts;
+}
 
-  let drawn = 0;
+function sampleQuad(
+  x0: number, y0: number, x1: number, y1: number,
+  x2: number, y2: number, n: number
+): { x: number; y: number }[] {
+  const pts: { x: number; y: number }[] = [];
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    const mt = 1 - t;
+    pts.push({
+      x: mt * mt * x0 + 2 * mt * t * x1 + t * t * x2,
+      y: mt * mt * y0 + 2 * mt * t * y1 + t * t * y2,
+    });
+  }
+  return pts;
+}
+
+/**
+ * ПРАВИЛЬНАЯ рукописная анимация:
+ * Рисуем символ через off-screen canvas с clip-маской, которая открывается по progress.
+ * Финальный вид (filled) всегда сохраняется — маска только «открывает» его как Write-on.
+ */
+export function drawGlyphWriteOn(
+  ctx: CanvasRenderingContext2D,
+  ac: AnimatableChar,
+  progress: number,
+  fillColor: string,
+  direction: WriteOnDirection = "left-to-right"
+) {
+  if (progress <= 0) return;
+  if (progress >= 1) {
+    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
+    return;
+  }
+
+  const { x, y, fontSize } = ac;
+  const w = ac.glyphPaths[0].advanceWidth + fontSize * 0.2;
+  const h = fontSize * 1.4;
+  const left = x - fontSize * 0.05;
+  const top = y - fontSize * 1.1;
+
   ctx.save();
-  ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = strokeWidth;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.fillStyle = "transparent";
+  ctx.beginPath();
 
-  for (let si = 0; si < subpaths.length; si++) {
-    const sp = subpaths[si];
-    const spLen = lengths[si];
-    if (drawn >= targetLength) break;
-
-    const remaining = targetLength - drawn;
-    const subProgress = Math.min(1, remaining / spLen);
-
-    ctx.beginPath();
-    drawSubpathProgress(ctx, sp, subProgress);
-    ctx.stroke();
-
-    drawn += spLen;
+  if (direction === "left-to-right") {
+    const clipW = w * progress;
+    ctx.rect(left, top - 4, clipW, h + 8);
+  } else if (direction === "top-to-bottom") {
+    const clipH = h * progress;
+    ctx.rect(left - 4, top, w + 8, clipH);
+  } else if (direction === "right-to-left") {
+    const clipW = w * progress;
+    ctx.rect(left + w - clipW, top - 4, clipW, h + 8);
+  } else if (direction === "bottom-to-top") {
+    const clipH = h * progress;
+    ctx.rect(left - 4, top + h - clipH, w + 8, clipH);
+  } else if (direction === "diagonal-tl") {
+    ctx.rect(left, top, w * progress * 1.5, h * progress * 1.5);
   }
 
+  ctx.clip();
+  drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
   ctx.restore();
 }
 
-/** Рисует subpath с заданным прогрессом */
-function drawSubpathProgress(
+export type WriteOnDirection =
+  | "left-to-right"
+  | "right-to-left"
+  | "top-to-bottom"
+  | "bottom-to-top"
+  | "diagonal-tl";
+
+/**
+ * Рисует «живую» прорисовку штрихом (режим авто):
+ * Сначала рисуем финальный символ с очень низкой прозрачностью (ghost),
+ * затем поверх — нарастающий stroke по скелетным точкам.
+ * Когда progress=1, переключаемся на полный filled.
+ */
+export function drawGlyphHandwrite(
   ctx: CanvasRenderingContext2D,
-  commands: opentype.PathCommand[],
-  progress: number
+  ac: AnimatableChar,
+  progress: number,
+  fillColor: string,
+  strokeWidth: number
 ) {
   if (progress <= 0) return;
+  if (progress >= 1) {
+    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
+    return;
+  }
 
-  const segLengths = computeSegmentLengths(commands);
-  const total = segLengths.reduce((a, b) => a + b, 0);
-  const target = total * progress;
+  // Ghost: финальный символ с прозрачностью 0.08 — пользователь видит куда идёт
+  ctx.save();
+  ctx.globalAlpha = 0.08;
+  drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
+  ctx.restore();
+
+  // Stroke: рисуем нарастающий путь по strokePoints
+  const strokes = ac.strokePoints;
+  if (strokes.length === 0) {
+    // Fallback: Write-on через clip
+    drawGlyphWriteOn(ctx, ac, progress, fillColor, "left-to-right");
+    return;
+  }
+
+  // Общее количество точек
+  const totalPts = strokes.reduce((s, st) => s + st.length, 0);
+  const targetPts = Math.floor(totalPts * progress);
+
+  ctx.save();
+  ctx.strokeStyle = fillColor;
+  ctx.lineWidth = strokeWidth;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
 
   let drawn = 0;
-  let started = false;
+  for (const stroke of strokes) {
+    if (drawn >= targetPts) break;
+    const avail = Math.min(stroke.length, targetPts - drawn);
+    if (avail < 2) { drawn += stroke.length; continue; }
 
-  for (let i = 0; i < commands.length; i++) {
-    const cmd = commands[i];
-    const seg = segLengths[i];
-
-    if (cmd.type === "M") {
-      ctx.moveTo(cmd.x, cmd.y);
-      started = true;
-      continue;
+    ctx.beginPath();
+    ctx.moveTo(stroke[0].x, stroke[0].y);
+    for (let i = 1; i < avail; i++) {
+      ctx.lineTo(stroke[i].x, stroke[i].y);
     }
-    if (!started) continue;
-    if (drawn >= target) break;
-
-    const remaining = target - drawn;
-    const t = seg > 0 ? Math.min(1, remaining / seg) : 1;
-
-    if (cmd.type === "L") {
-      const prev = getPrevPoint(commands, i);
-      const px = prev.x + (cmd.x - prev.x) * t;
-      const py = prev.y + (cmd.y - prev.y) * t;
-      ctx.lineTo(px, py);
-    } else if (cmd.type === "C") {
-      const prev = getPrevPoint(commands, i);
-      const pt = bezierPoint(t, prev.x, prev.y, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
-      // Используем дробную кривую
-      const c1 = bezierPoint(t * 0.33, prev.x, prev.y, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
-      const c2 = bezierPoint(t * 0.67, prev.x, prev.y, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y);
-      ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, pt.x, pt.y);
-    } else if (cmd.type === "Q") {
-      const prev = getPrevPoint(commands, i);
-      const pt = quadPoint(t, prev.x, prev.y, cmd.x1, cmd.y1, cmd.x, cmd.y);
-      const cp = quadPoint(t * 0.5, prev.x, prev.y, cmd.x1, cmd.y1, cmd.x, cmd.y);
-      ctx.quadraticCurveTo(cp.x, cp.y, pt.x, pt.y);
-    } else if (cmd.type === "Z") {
-      ctx.closePath();
-    }
-
-    drawn += seg;
+    ctx.stroke();
+    drawn += stroke.length;
   }
-}
 
-function computeSegmentLengths(commands: opentype.PathCommand[]): number[] {
-  const lengths: number[] = [];
-  let cx = 0, cy = 0;
-  for (const cmd of commands) {
-    if (cmd.type === "M") { cx = cmd.x; cy = cmd.y; lengths.push(0); }
-    else if (cmd.type === "L") {
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      lengths.push(Math.sqrt(dx * dx + dy * dy));
-      cx = cmd.x; cy = cmd.y;
-    } else if (cmd.type === "C") {
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      lengths.push(Math.sqrt(dx * dx + dy * dy) * 1.4);
-      cx = cmd.x; cy = cmd.y;
-    } else if (cmd.type === "Q") {
-      const dx = cmd.x - cx; const dy = cmd.y - cy;
-      lengths.push(Math.sqrt(dx * dx + dy * dy) * 1.2);
-      cx = cmd.x; cy = cmd.y;
-    } else {
-      lengths.push(0);
-    }
+  ctx.restore();
+
+  // Когда нарисовано >90% — начинаем плавно показывать filled поверх
+  if (progress > 0.85) {
+    const alpha = (progress - 0.85) / 0.15;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
+    ctx.restore();
   }
-  return lengths;
-}
-
-function getPrevPoint(commands: opentype.PathCommand[], i: number): { x: number; y: number } {
-  for (let j = i - 1; j >= 0; j--) {
-    const c = commands[j];
-    if (c.type === "M" || c.type === "L" || c.type === "C" || c.type === "Q") {
-      return { x: c.x, y: c.y };
-    }
-  }
-  return { x: 0, y: 0 };
-}
-
-function bezierPoint(
-  t: number,
-  x0: number, y0: number,
-  x1: number, y1: number,
-  x2: number, y2: number,
-  x3: number, y3: number
-) {
-  const mt = 1 - t;
-  return {
-    x: mt * mt * mt * x0 + 3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t * t * t * x3,
-    y: mt * mt * mt * y0 + 3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t * t * t * y3,
-  };
-}
-
-function quadPoint(t: number, x0: number, y0: number, x1: number, y1: number, x2: number, y2: number) {
-  const mt = 1 - t;
-  return {
-    x: mt * mt * x0 + 2 * mt * t * x1 + t * t * x2,
-    y: mt * mt * y0 + 2 * mt * t * y1 + t * t * y2,
-  };
 }
 
 /** Рисует символ полностью как filled shape */
@@ -267,3 +327,7 @@ export function drawGlyphFull(
   ctx.fill("evenodd");
   ctx.restore();
 }
+
+/** Устаревший экспорт, оставлен для совместимости */
+export { buildAnimatableCharsWrapped as buildAnimatableChars };
+export type { AnimatableChar };
