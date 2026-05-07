@@ -5,26 +5,54 @@ export interface GlyphPath {
   advanceWidth: number;
 }
 
+export interface Stroke {
+  points: { x: number; y: number }[];
+}
+
 export interface AnimatableChar {
   char: string;
-  glyphPaths: GlyphPath[];
-  /** Набор точек для «чернильной» прорисовки (stroke по средней линии) */
-  strokePoints: { x: number; y: number }[][];
+  commands: opentype.PathCommand[];
+  /** Штрихи — последовательные полилинии контуров буквы, пронумерованные в порядке рисования */
+  strokes: Stroke[];
+  advanceWidth: number;
   x: number;
   y: number;
-  unitsPerEm: number;
   fontSize: number;
-  /** Порядковый номер символа в строке */
   charIndex: number;
-  /** Индекс строки */
   lineIndex: number;
+  isSpace: boolean;
+}
+
+export type WriteOnDirection =
+  | "left-to-right"
+  | "right-to-left"
+  | "top-to-bottom"
+  | "bottom-to-top"
+  | "diagonal-tl";
+
+export interface ManualStroke {
+  points: { x: number; y: number }[];
 }
 
 export async function loadFontFromBuffer(buffer: ArrayBuffer): Promise<opentype.Font> {
   return opentype.parse(buffer);
 }
 
-/** Строит набор AnimatableChar с учётом переноса строк (word-wrap) */
+// ─── measure ───────────────────────────────────────────────────────────────────
+export function measureText(font: opentype.Font, text: string, fontSize: number): number {
+  const scale = fontSize / font.unitsPerEm;
+  let w = 0;
+  for (const ch of text) {
+    const g = font.charToGlyph(ch);
+    // Пробелы тоже считаем через advanceWidth гlifа пробела
+    if (g) {
+      w += (g.advanceWidth ?? 0) * scale;
+    }
+  }
+  return w;
+}
+
+// ─── word-wrap + build chars ───────────────────────────────────────────────────
 export function buildAnimatableCharsWrapped(
   font: opentype.Font,
   text: string,
@@ -37,29 +65,32 @@ export function buildAnimatableCharsWrapped(
   padX: number,
   padY: number
 ): AnimatableChar[] {
+  void bold; void italic; void color;
+
   const scale = fontSize / font.unitsPerEm;
-  const lineHeight = fontSize * 1.45;
+  const lineHeight = fontSize * 1.5;
   const maxWidth = canvasWidth - padX * 2;
 
-  // Разбиваем на «жёсткие» строки по \n, затем word-wrap
+  // Жёсткие переносы по \n, затем word-wrap
   const hardLines = text.split("\n");
   const wrappedLines: string[] = [];
 
   for (const hard of hardLines) {
     if (hard.length === 0) { wrappedLines.push(""); continue; }
-    const words = hard.split(" ");
-    let currentLine = "";
+
+    // Word-wrap: разбиваем по пробелам, сохраняя пробелы в составе токенов
+    const words = hard.split(/(?<= )/); // split after space — сохраняем пробелы
+    let current = "";
     for (const word of words) {
-      const test = currentLine ? currentLine + " " + word : word;
-      const testWidth = measureText(font, test, fontSize);
-      if (testWidth > maxWidth && currentLine.length > 0) {
-        wrappedLines.push(currentLine);
-        currentLine = word;
+      const test = current + word;
+      if (measureText(font, test, fontSize) > maxWidth && current.length > 0) {
+        wrappedLines.push(current.trimEnd());
+        current = word.trimStart();
       } else {
-        currentLine = test;
+        current = test;
       }
     }
-    if (currentLine) wrappedLines.push(currentLine);
+    if (current.length > 0) wrappedLines.push(current);
   }
 
   const result: AnimatableChar[] = [];
@@ -77,77 +108,73 @@ export function buildAnimatableCharsWrapped(
     for (let ci = 0; ci < lineText.length; ci++) {
       const char = lineText[ci];
       const glyph = font.charToGlyph(char);
-      if (!glyph) { cursorX += fontSize * 0.3; continue; }
+      const advW = glyph ? (glyph.advanceWidth ?? 0) * scale : fontSize * 0.3;
+      const isSpace = char === " " || (glyph !== null && (glyph.advanceWidth ?? 0) > 0 && (glyph.path?.commands?.length ?? 0) === 0);
 
-      const path = glyph.getPath(cursorX, baseline, fontSize);
+      const path = glyph ? glyph.getPath(cursorX, baseline, fontSize) : { commands: [] as opentype.PathCommand[] };
       const commands = path.commands;
-      const advW = (glyph.advanceWidth ?? 0) * scale;
 
       result.push({
         char,
-        glyphPaths: [{ commands, advanceWidth: advW }],
-        strokePoints: buildStrokePoints(commands),
+        commands,
+        strokes: buildStrokes(commands),
+        advanceWidth: advW,
         x: cursorX,
         y: baseline,
-        unitsPerEm: font.unitsPerEm,
         fontSize,
         charIndex: globalIdx++,
         lineIndex: li,
+        isSpace,
       });
 
       cursorX += advW;
     }
   });
 
-  void bold; void italic; void color;
   return result;
 }
 
-function measureText(font: opentype.Font, text: string, fontSize: number): number {
-  const scale = fontSize / font.unitsPerEm;
-  let w = 0;
-  for (const ch of text) {
-    const g = font.charToGlyph(ch);
-    if (g) w += (g.advanceWidth ?? 0) * scale;
-    else w += fontSize * 0.3;
-  }
-  return w;
-}
-
+// ─── строим штрихи из SVG-команд ───────────────────────────────────────────────
 /**
- * Из SVG-команд строим «скелетные» полилинии для рисования пером.
- * Каждый subpath — отдельный штрих.
+ * Разбиваем SVG-path на субпути (strokePoints).
+ * Каждый M начинает новый штрих. Кривые Безье семплируются в точки.
+ * Это и есть «перо» — именно по этим полилиниям рисуем штрих.
  */
-function buildStrokePoints(commands: opentype.PathCommand[]): { x: number; y: number }[][] {
-  const strokes: { x: number; y: number }[][] = [];
-  let current: { x: number; y: number }[] = [];
+function buildStrokes(commands: opentype.PathCommand[]): Stroke[] {
+  const strokes: Stroke[] = [];
+  let cur: { x: number; y: number }[] = [];
   let cx = 0, cy = 0;
+
+  const flush = () => {
+    if (cur.length >= 2) strokes.push({ points: cur });
+    cur = [];
+  };
 
   for (const cmd of commands) {
     if (cmd.type === "M") {
-      if (current.length > 1) strokes.push(current);
-      current = [{ x: cmd.x, y: cmd.y }];
+      flush();
+      cur = [{ x: cmd.x, y: cmd.y }];
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === "L") {
-      current.push({ x: cmd.x, y: cmd.y });
+      cur.push({ x: cmd.x, y: cmd.y });
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === "C") {
-      const pts = sampleCubic(cx, cy, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y, 16);
-      current.push(...pts);
+      const pts = sampleCubic(cx, cy, cmd.x1, cmd.y1, cmd.x2, cmd.y2, cmd.x, cmd.y, 20);
+      cur.push(...pts);
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === "Q") {
-      const pts = sampleQuad(cx, cy, cmd.x1, cmd.y1, cmd.x, cmd.y, 10);
-      current.push(...pts);
+      const pts = sampleQuad(cx, cy, cmd.x1, cmd.y1, cmd.x, cmd.y, 12);
+      cur.push(...pts);
       cx = cmd.x; cy = cmd.y;
     } else if (cmd.type === "Z") {
-      if (current.length > 0 && current[0]) {
-        current.push({ x: current[0].x, y: current[0].y });
-      }
-      if (current.length > 1) strokes.push(current);
-      current = [];
+      // замыкаем субпуть, добавляем точку возврата к началу
+      if (cur.length > 0 && cur[0]) cur.push({ ...cur[0] });
+      flush();
+      cx = cur[0]?.x ?? cx;
+      cy = cur[0]?.y ?? cy;
     }
   }
-  if (current.length > 1) strokes.push(current);
+  flush();
   return strokes;
 }
 
@@ -157,8 +184,7 @@ function sampleCubic(
 ): { x: number; y: number }[] {
   const pts: { x: number; y: number }[] = [];
   for (let i = 1; i <= n; i++) {
-    const t = i / n;
-    const mt = 1 - t;
+    const t = i / n; const mt = 1 - t;
     pts.push({
       x: mt * mt * mt * x0 + 3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t * t * t * x3,
       y: mt * mt * mt * y0 + 3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t * t * t * y3,
@@ -173,8 +199,7 @@ function sampleQuad(
 ): { x: number; y: number }[] {
   const pts: { x: number; y: number }[] = [];
   for (let i = 1; i <= n; i++) {
-    const t = i / n;
-    const mt = 1 - t;
+    const t = i / n; const mt = 1 - t;
     pts.push({
       x: mt * mt * x0 + 2 * mt * t * x1 + t * t * x2,
       y: mt * mt * y0 + 2 * mt * t * y1 + t * t * y2,
@@ -183,137 +208,122 @@ function sampleQuad(
   return pts;
 }
 
+// ─── АВТОМАТИЧЕСКАЯ АНИМАЦИЯ ───────────────────────────────────────────────────
 /**
- * ПРАВИЛЬНАЯ рукописная анимация:
- * Рисуем символ через off-screen canvas с clip-маской, которая открывается по progress.
- * Финальный вид (filled) всегда сохраняется — маска только «открывает» его как Write-on.
- */
-export function drawGlyphWriteOn(
-  ctx: CanvasRenderingContext2D,
-  ac: AnimatableChar,
-  progress: number,
-  fillColor: string,
-  direction: WriteOnDirection = "left-to-right"
-) {
-  if (progress <= 0) return;
-  if (progress >= 1) {
-    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
-    return;
-  }
-
-  const { x, y, fontSize } = ac;
-  const w = ac.glyphPaths[0].advanceWidth + fontSize * 0.2;
-  const h = fontSize * 1.4;
-  const left = x - fontSize * 0.05;
-  const top = y - fontSize * 1.1;
-
-  ctx.save();
-  ctx.beginPath();
-
-  if (direction === "left-to-right") {
-    const clipW = w * progress;
-    ctx.rect(left, top - 4, clipW, h + 8);
-  } else if (direction === "top-to-bottom") {
-    const clipH = h * progress;
-    ctx.rect(left - 4, top, w + 8, clipH);
-  } else if (direction === "right-to-left") {
-    const clipW = w * progress;
-    ctx.rect(left + w - clipW, top - 4, clipW, h + 8);
-  } else if (direction === "bottom-to-top") {
-    const clipH = h * progress;
-    ctx.rect(left - 4, top + h - clipH, w + 8, clipH);
-  } else if (direction === "diagonal-tl") {
-    ctx.rect(left, top, w * progress * 1.5, h * progress * 1.5);
-  }
-
-  ctx.clip();
-  drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
-  ctx.restore();
-}
-
-export type WriteOnDirection =
-  | "left-to-right"
-  | "right-to-left"
-  | "top-to-bottom"
-  | "bottom-to-top"
-  | "diagonal-tl";
-
-/**
- * Рисует «живую» прорисовку штрихом (режим авто):
- * Сначала рисуем финальный символ с очень низкой прозрачностью (ghost),
- * затем поверх — нарастающий stroke по скелетным точкам.
- * Когда progress=1, переключаемся на полный filled.
+ * Рисует символ как «письмо ручкой»:
+ * - Идём по strokes (субпутям), рисуя линию точка за точкой.
+ * - Когда progress=1 — рисуем finalized filled shape.
+ * - Никакого ghost, никакой отдельной обводки контура.
+ * - Штрих имеет такую же ширину как толщина пера.
  */
 export function drawGlyphHandwrite(
   ctx: CanvasRenderingContext2D,
   ac: AnimatableChar,
   progress: number,
   fillColor: string,
-  strokeWidth: number
+  penWidth: number
 ) {
-  if (progress <= 0) return;
+  if (progress <= 0 || ac.isSpace) return;
   if (progress >= 1) {
-    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
+    drawGlyphFull(ctx, ac.commands, fillColor);
     return;
   }
 
-  // Ghost: финальный символ с прозрачностью 0.08 — пользователь видит куда идёт
-  ctx.save();
-  ctx.globalAlpha = 0.08;
-  drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
-  ctx.restore();
+  const { strokes } = ac;
+  if (strokes.length === 0) return;
 
-  // Stroke: рисуем нарастающий путь по strokePoints
-  const strokes = ac.strokePoints;
-  if (strokes.length === 0) {
-    // Fallback: Write-on через clip
-    drawGlyphWriteOn(ctx, ac, progress, fillColor, "left-to-right");
-    return;
-  }
+  // Считаем общее число точек
+  const totalPts = strokes.reduce((s, st) => s + st.points.length, 0);
+  if (totalPts < 2) return;
 
-  // Общее количество точек
-  const totalPts = strokes.reduce((s, st) => s + st.length, 0);
-  const targetPts = Math.floor(totalPts * progress);
+  const targetPts = progress * totalPts;
 
   ctx.save();
   ctx.strokeStyle = fillColor;
-  ctx.lineWidth = strokeWidth;
+  ctx.lineWidth = penWidth;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  let drawn = 0;
+
+  for (const stroke of strokes) {
+    if (drawn >= targetPts) break;
+    const pts = stroke.points;
+    const available = Math.min(pts.length, Math.ceil(targetPts - drawn));
+    if (available < 1) { drawn += pts.length; continue; }
+
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < available; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    drawn += pts.length;
+  }
+
+  ctx.restore();
+}
+
+// ─── РУЧНАЯ АНИМАЦИЯ — пользовательские штрихи ────────────────────────────────
+/**
+ * Рисует символ через пользовательские штрихи (manualStrokes).
+ * Если manualStrokes не заданы — использует автоматические strokes.
+ */
+export function drawGlyphManual(
+  ctx: CanvasRenderingContext2D,
+  ac: AnimatableChar,
+  progress: number,
+  fillColor: string,
+  penWidth: number,
+  manualStrokes?: ManualStroke[]
+) {
+  if (progress <= 0 || ac.isSpace) return;
+  if (progress >= 1) {
+    drawGlyphFull(ctx, ac.commands, fillColor);
+    return;
+  }
+
+  const strokes = manualStrokes && manualStrokes.length > 0 ? manualStrokes : ac.strokes;
+  if (strokes.length === 0) return;
+
+  const totalPts = strokes.reduce((s, st) => s + st.points.length, 0);
+  if (totalPts < 2) return;
+
+  const targetPts = progress * totalPts;
+
+  ctx.save();
+  ctx.strokeStyle = fillColor;
+  ctx.lineWidth = penWidth;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
   let drawn = 0;
   for (const stroke of strokes) {
     if (drawn >= targetPts) break;
-    const avail = Math.min(stroke.length, targetPts - drawn);
-    if (avail < 2) { drawn += stroke.length; continue; }
+    const pts = stroke.points;
+    const available = Math.min(pts.length, Math.ceil(targetPts - drawn));
+    if (available < 1) { drawn += pts.length; continue; }
 
     ctx.beginPath();
-    ctx.moveTo(stroke[0].x, stroke[0].y);
-    for (let i = 1; i < avail; i++) {
-      ctx.lineTo(stroke[i].x, stroke[i].y);
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < available; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
     }
     ctx.stroke();
-    drawn += stroke.length;
+    drawn += pts.length;
   }
 
   ctx.restore();
-
-  // Когда нарисовано >90% — начинаем плавно показывать filled поверх
-  if (progress > 0.85) {
-    const alpha = (progress - 0.85) / 0.15;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    drawGlyphFull(ctx, ac.glyphPaths[0].commands, fillColor);
-    ctx.restore();
-  }
 }
 
-/** Рисует символ полностью как filled shape */
+// ─── Полностью залитый символ ─────────────────────────────────────────────────
 export function drawGlyphFull(
   ctx: CanvasRenderingContext2D,
   commands: opentype.PathCommand[],
   fillColor: string
 ) {
+  if (!commands || commands.length === 0) return;
   ctx.save();
   ctx.fillStyle = fillColor;
   ctx.beginPath();
@@ -328,6 +338,5 @@ export function drawGlyphFull(
   ctx.restore();
 }
 
-/** Устаревший экспорт, оставлен для совместимости */
+// Экспорт для совместимости
 export { buildAnimatableCharsWrapped as buildAnimatableChars };
-export type { AnimatableChar };
