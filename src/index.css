@@ -4,89 +4,50 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --background: 220 16% 8%;
+    --foreground: 220 10% 90%;
 
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card: 220 14% 11%;
+    --card-foreground: 220 10% 90%;
 
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
+    --popover: 220 14% 11%;
+    --popover-foreground: 220 10% 90%;
 
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
+    --primary: 158 64% 52%;
+    --primary-foreground: 220 16% 8%;
 
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 220 12% 16%;
+    --secondary-foreground: 220 10% 75%;
 
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
+    --muted: 220 12% 14%;
+    --muted-foreground: 220 8% 50%;
 
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
+    --accent: 158 64% 52%;
+    --accent-foreground: 220 16% 8%;
 
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
 
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+    --border: 220 12% 18%;
+    --input: 220 12% 16%;
+    --ring: 158 64% 52%;
 
-    --radius: 0.5rem;
+    --radius: 0.375rem;
 
-    --sidebar-background: 0 0% 98%;
+    --sidebar-background: 220 16% 6%;
+    --sidebar-foreground: 220 8% 60%;
+    --sidebar-primary: 158 64% 52%;
+    --sidebar-primary-foreground: 220 16% 8%;
+    --sidebar-accent: 220 12% 14%;
+    --sidebar-accent-foreground: 220 10% 85%;
+    --sidebar-border: 220 12% 14%;
+    --sidebar-ring: 158 64% 52%;
 
-    --sidebar-foreground: 240 5.3% 26.1%;
-
-    --sidebar-primary: 240 5.9% 10%;
-
-    --sidebar-primary-foreground: 0 0% 98%;
-
-    --sidebar-accent: 240 4.8% 95.9%;
-
-    --sidebar-accent-foreground: 240 5.9% 10%;
-
-    --sidebar-border: 220 13% 91%;
-
-    --sidebar-ring: 217.2 91.2% 59.8%;
-  }
-
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
-    --sidebar-background: 240 5.9% 10%;
-    --sidebar-foreground: 240 4.8% 95.9%;
-    --sidebar-primary: 224.3 76.3% 48%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 240 3.7% 15.9%;
-    --sidebar-accent-foreground: 240 4.8% 95.9%;
-    --sidebar-border: 240 3.7% 15.9%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --panel-bg: 220 14% 10%;
+    --surface: 220 12% 13%;
+    --surface-hover: 220 12% 16%;
+    --ink: 158 64% 52%;
+    --ink-dim: 158 40% 35%;
   }
 }
 
@@ -97,5 +58,191 @@
 
   body {
     @apply bg-background text-foreground;
+    font-family: "Golos Text", sans-serif;
   }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 2px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+@layer utilities {
+  .font-handwriting {
+    font-family: "Caveat", cursive;
+  }
+
+  .font-mono-code {
+    font-family: "IBM Plex Mono", monospace;
+  }
+
+  .surface {
+    background: hsl(var(--surface));
+  }
+
+  .ink-glow {
+    box-shadow: 0 0 12px hsl(158 64% 52% / 0.25);
+  }
+
+  .panel {
+    background: hsl(var(--panel-bg));
+    border: 1px solid hsl(var(--border));
+  }
+
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease forwards;
+  }
+
+  .animate-slide-up {
+    animation: slideUp 0.25s ease forwards;
+  }
+
+  .animate-write {
+    animation: write 2s ease-in-out infinite;
+  }
+
+  .tab-active {
+    background: hsl(var(--surface));
+    color: hsl(var(--foreground));
+    border-bottom: 2px solid hsl(var(--ink));
+  }
+
+  .tab-inactive {
+    color: hsl(var(--muted-foreground));
+  }
+
+  .tab-inactive:hover {
+    color: hsl(var(--foreground));
+    background: hsl(var(--surface-hover) / 0.5);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes write {
+  0%,
+  100% {
+    transform: translateX(0) rotate(-1deg);
+  }
+  25% {
+    transform: translateX(6px) rotate(0.5deg);
+  }
+  50% {
+    transform: translateX(12px) rotate(-0.5deg);
+  }
+  75% {
+    transform: translateX(18px) rotate(1deg);
+  }
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes penStroke {
+  from {
+    stroke-dashoffset: 1000;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.cursor-blink {
+  animation: blink 1s step-end infinite;
+}
+
+.preview-text {
+  font-family: "Caveat", cursive;
+  font-size: 3rem;
+  line-height: 1.2;
+}
+
+.timeline-track {
+  height: 3px;
+  background: hsl(var(--border));
+  border-radius: 2px;
+  position: relative;
+}
+
+.timeline-progress {
+  height: 100%;
+  background: linear-gradient(90deg, hsl(var(--ink)), hsl(158 64% 65%));
+  border-radius: 2px;
+  transition: width 0.1s linear;
+}
+
+.mode-card {
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.mode-card:hover {
+  border-color: hsl(var(--ink-dim));
+  background: hsl(var(--surface-hover));
+}
+
+.mode-card.selected {
+  border-color: hsl(var(--ink));
+  background: hsl(158 64% 52% / 0.08);
+  box-shadow: 0 0 0 1px hsl(158 64% 52% / 0.3);
+}
+
+.font-card {
+  background: hsl(var(--surface));
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  transition: all 0.15s ease;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.font-card:hover {
+  border-color: hsl(var(--ink-dim));
+}
+
+.font-card.selected {
+  border-color: hsl(var(--ink));
 }
